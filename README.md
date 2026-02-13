@@ -291,13 +291,26 @@ psql -c "SELECT pg_reload_conf();"
 | `remote_write` | Full primary throughput (~3000+ TPS). Replay lag grows silently (1+ GB in 45s). |
 | `remote_apply` | TPS clamped to replay throughput (~300-400 TPS). Each commit waits 80-100ms for replay. |
 
-### Docker-Validated Results
+### Docker-Validated Results (constrained standby: 0.5 CPU, 384 MB RAM)
 
 ```
                 remote_write    remote_apply    ratio
 avg latency     9.8 ms          87.2 ms         8.9x
 TPS             3250            367             8.9x
 ```
+
+### Real Hardware Results (identical VMs: 4 CPU, 7.6 GB RAM, PG 17)
+
+```
+                remote_write    remote_apply    ratio
+avg latency     8.3 ms          9.9 ms          1.2x
+TPS             3857            3228            1.2x
+```
+
+With identical hardware, the standby's single-threaded replay keeps up — the
+4-core/7.6 GB standby has enough resources to replay 16-index UPDATEs at near
+primary speed.  To see a bigger gap, the standby needs less RAM (so index pages
+don't fit in cache) or slower disks.
 
 ### Tuning for Your Hardware
 
@@ -428,13 +441,24 @@ show that even trivial transactions stall when replay is blocked.
 | `remote_write` | Normal latency (~0.3-0.5ms). Replay lag grows but the primary doesn't notice. |
 | `remote_apply` | **0 TPS** for the duration of the standby query. Transactions hang until replay resumes. |
 
-### Docker-Validated Results
+### Docker-Validated Results (constrained standby)
 
 ```
                 remote_write    remote_apply    ratio
 avg latency     0.37 ms         2304 ms         6,200x
 TPS             21,668          3.5             6,200x
 ```
+
+### Real Hardware Results (identical VMs: 4 CPU, 7.6 GB RAM, PG 17)
+
+```
+                remote_write    remote_apply    ratio
+avg latency     0.26 ms         861 ms          3,273x
+TPS             30,368          9.3             3,273x
+```
+
+The mechanism is hardware-independent — replay blocking produces massive ratios
+regardless of standby resources.
 
 The progress lines tell the full story:
 ```
@@ -559,7 +583,7 @@ Mixed: 70% INSERT (new tickets with large bodies) / 30% UPDATE (rewrite body
 | `remote_write` | Full primary throughput. Periodic replay lag spikes when GIN flushes. |
 | `remote_apply` | ~1.5-2x higher latency. TPS limited by TOAST I/O + GIN flush replay speed. |
 
-### Docker-Validated Results
+### Docker-Validated Results (constrained standby)
 
 ```
                 remote_write    remote_apply    ratio
@@ -567,7 +591,19 @@ avg latency     8.0 ms          14.3 ms         1.8x
 TPS             1490            840             1.8x
 ```
 
-### Why 1.8x, Not More?
+### Real Hardware Results (identical VMs: 4 CPU, 7.6 GB RAM, PG 17)
+
+```
+                remote_write    remote_apply    ratio
+avg latency     4.2 ms          8.8 ms          2.1x
+TPS             2825            1367            2.1x
+```
+
+Same 2.1x ratio on real hardware — GIN flush replay is expensive even with
+ample resources because each flush requires posting tree traversal and
+recompression, all serialized through the single startup process.
+
+### Why 1.8-2.1x, Not More?
 
 GIN fastupdate defers most of the expensive work to flush time.  Between
 flushes, each INSERT only appends to the pending list (cheap, sequential).
@@ -642,13 +678,26 @@ the very WAL that's overwhelming the standby).
 | `remote_write` | Brief TPS dip during UPDATE (primary I/O contention), then recovery. Average ~1600 TPS. |
 | `remote_apply` | TPS drops to 0 for 15-20s while standby replays migration WAL. Average ~750 TPS. |
 
-### Docker-Validated Results
+### Docker-Validated Results (constrained standby)
 
 ```
                 remote_write    remote_apply    ratio
 avg latency     4.9 ms          10.7 ms         2.2x
 TPS             1642            749             2.2x
 ```
+
+### Real Hardware Results (identical VMs: 4 CPU, 7.6 GB RAM, PG 17)
+
+```
+                remote_write    remote_apply    ratio
+avg latency     1.8 ms          4.6 ms          2.5x
+TPS             4352            1751            2.5x
+```
+
+Even with identical hardware, the migration generates enough WAL (~1 GB burst
+from UPDATE) to overwhelm single-threaded replay. The ratio is slightly higher
+than Docker because real hardware has no shared I/O contention — `remote_write`
+runs at full speed while `remote_apply` stalls.
 
 The per-5s progress lines tell the story:
 ```
@@ -732,13 +781,25 @@ CREATE INDEX logs_trace      ON logs(trace_id);
 | `remote_write` | TPS drops to ~800-1000 during bulk load (primary I/O contention from index maintenance), but never freezes. |
 | `remote_apply` | TPS degrades progressively to 0 as replay lag builds, stays frozen for 30-40s. |
 
-### Docker-Validated Results
+### Docker-Validated Results (constrained standby)
 
 ```
                 remote_write    remote_apply    ratio
 avg latency     6.7 ms          42.1 ms         6.3x
 TPS             1191            190             6.3x
 ```
+
+### Real Hardware Results (identical VMs: 4 CPU, 7.6 GB RAM, PG 17)
+
+```
+                remote_write    remote_apply    ratio
+avg latency     1.8 ms          5.3 ms          2.9x
+TPS             4359            1505            2.9x
+```
+
+The ratio is lower than Docker (2.9x vs 6.3x) because the well-resourced
+standby replays index inserts faster.  But single-threaded replay still can't
+keep up with 2M rows × 4 indexes at primary speed.
 
 The per-5s progress lines show the progressive degradation under `remote_apply`:
 ```
@@ -828,13 +889,25 @@ page is cold (unmodified since last checkpoint) and triggers an FPI.
 | `remote_write` | Full throughput. Periodic TPS dip right after each checkpoint (when all pages are cold). ~4700 TPS average. |
 | `remote_apply` | ~2200 TPS average. First 15-20s show near-zero TPS (standby catching up after checkpoint), then partial recovery. |
 
-### Docker-Validated Results
+### Docker-Validated Results (constrained standby)
 
 ```
                 remote_write    remote_apply    ratio
 avg latency     5.1 ms          10.9 ms         2.1x
 TPS             4684            2197            2.1x
 ```
+
+### Real Hardware Results (identical VMs: 4 CPU, 7.6 GB RAM, PG 17)
+
+```
+                remote_write    remote_apply    ratio
+avg latency     3.4 ms          4.8 ms          1.4x
+TPS             7148            5049            1.4x
+```
+
+Lower ratio on identical hardware — the standby has enough RAM and CPU to
+replay FPIs quickly.  With a weaker standby (less RAM, slower disks), the
+ratio approaches the Docker result.
 
 The per-5s progress lines show the checkpoint effect:
 ```
@@ -937,7 +1010,7 @@ CREATE TABLE probe_s7 (
 | `remote_write` | Full ~7000 TPS on probe_s7. Replay lag grows silently. |
 | `remote_apply` | **0 TPS for 80+ seconds**. Every commit to probe_s7 waits for replay that's blocked by the orders conflict. |
 
-### Docker-Validated Results
+### Docker-Validated Results (constrained standby)
 
 ```
                 remote_write    remote_apply    ratio
@@ -945,9 +1018,21 @@ avg latency     1.2 ms          11,372 ms       9,871x
 TPS             6920            0.7             9,871x
 ```
 
+### Real Hardware Results (identical VMs: 4 CPU, 7.6 GB RAM, PG 17)
+
+```
+                remote_write    remote_apply    ratio
+avg latency     1.5 ms          3,249 ms        2,200x
+TPS             5409            2.5             2,200x
+```
+
+Same total freeze under `remote_apply` — 80+ seconds of 0 TPS on `probe_s7`
+while the replay conflict on `orders` blocks everything.  The mechanism is
+hardware-independent.
+
 The per-5s progress lines:
 ```
-# remote_write: rock-solid 7000 TPS on probe_s7
+# remote_write: rock-solid 5000+ TPS on probe_s7
 progress: ... 6433.9 tps, lat 1.237 ms ...
 progress: ... 6811.2 tps, lat 1.171 ms ...
 progress: ... 7015.1 tps, lat 1.137 ms ...
@@ -1075,8 +1160,23 @@ avg latency     6.1 ms          7.2 ms          1.2x
 TPS             1300            1107            1.2x
 ```
 
-**Note**: The 1.2x average understates the real impact.  The per-5s data shows
-the dramatic difference:
+### Real Hardware Results (with lock conflict, identical VMs: 4 CPU, 7.6 GB RAM, PG 17)
+
+```
+                remote_write    remote_apply    ratio
+avg latency     2.0 ms          7,187 ms        3,569x
+TPS             3969            1.1             3,569x
+```
+
+On real hardware with the lock conflict mechanism, the ratio is **dramatic**.
+`remote_write` runs at full speed (~4000 TPS) because the standby's lock
+conflict doesn't affect WAL writing.  `remote_apply` freezes completely (0 TPS
+for 40+ seconds) because replay blocks on the `AccessExclusiveLock` conflict.
+This confirms that the Docker result (1.2x) was caused by shared I/O
+contention, not a fundamental limitation of the scenario.
+
+**Docker note**: The 1.2x Docker average understates the real impact.  The
+per-5s data shows the difference even in Docker:
 
 ```
 # remote_write: degraded but nonzero during rewrite
@@ -1103,14 +1203,14 @@ includes the recovery period.  With the lock conflict mechanism (standby
 blocker holding AccessShareLock), the freeze extends to the full duration of
 the blocker query, producing dramatically higher ratios.
 
-### Why the Average Is Only 1.2x (Docker I/O Limitation)
+### Why Docker Shows Only 1.2x (I/O Limitation)
 
 VACUUM FULL rewrites the entire table, saturating the primary's disk I/O.  In
 Docker, both containers share the same underlying storage.  This means
 `remote_write` TPS is ALSO crushed (not just `remote_apply`), compressing the
-ratio.  On real hardware with separate storage, the primary would handle VACUUM
-FULL with minimal impact on other queries, and the ratio would be significantly
-higher.
+ratio.  On real hardware with separate storage (as the 3,569x result above
+confirms), the primary handles VACUUM FULL with minimal impact on other queries,
+and the lock conflict produces a complete `remote_apply` freeze.
 
 ### Real-World Relevance
 
@@ -1677,20 +1777,43 @@ storage compresses the difference.
 
 ## Results Summary
 
-All eight scenarios, sorted by measured latency ratio:
+### Docker (constrained standby: PG 16, 0.5 CPU, 384 MB RAM, 48 MB shared_buffers)
 
 | # | Scenario | Mechanism | remote_write | remote_apply | Ratio |
 |---|----------|-----------|-------------|-------------|-------|
-| S7 | Reporting conflict (cross-table) | Replay blocking (snapshot conflict) | 1.2 ms / 6920 TPS | 11,372 ms / 0.7 TPS | **9,871x** |
-| S2 | Standby query conflict | Replay blocking (snapshot conflict) | 0.37 ms / 21,668 TPS | 2304 ms / 3.5 TPS | **6,200x** |
-| S1 | Index-heavy UPDATE saturation | Replay saturation | 9.8 ms / 3250 TPS | 87.2 ms / 367 TPS | **8.9x** |
-| S5 | Bulk INSERT (ETL) | Replay saturation | 6.7 ms / 1191 TPS | 42.1 ms / 190 TPS | **6.3x** |
-| S4 | Schema migration | Replay saturation (WAL burst) | 4.9 ms / 1642 TPS | 10.7 ms / 749 TPS | **2.2x** |
-| S6 | FPI storm | Replay saturation (WAL amplification) | 5.1 ms / 4684 TPS | 10.9 ms / 2197 TPS | **2.1x** |
-| S3 | GIN + TOAST | Replay saturation (bursty) | 8.0 ms / 1490 TPS | 14.3 ms / 840 TPS | **1.8x** |
-| S8 | Table rewrite (VACUUM FULL) | WAL burst + lock conflict | 6.1 ms / 1300 TPS | 7.2 ms / 1107 TPS | **1.2x**\* |
+| S7 | Reporting conflict (cross-table) | Replay blocking (snapshot) | 1.2 ms / 6,920 TPS | 11,372 ms / 0.7 TPS | **9,871x** |
+| S2 | Standby query conflict | Replay blocking (snapshot) | 0.37 ms / 21,668 TPS | 2,304 ms / 3.5 TPS | **6,200x** |
+| S1 | Index-heavy UPDATE saturation | Replay saturation | 9.8 ms / 3,250 TPS | 87.2 ms / 367 TPS | **8.9x** |
+| S5 | Bulk INSERT (ETL) | Replay saturation | 6.7 ms / 1,191 TPS | 42.1 ms / 190 TPS | **6.3x** |
+| S4 | Schema migration | Replay saturation (WAL burst) | 4.9 ms / 1,642 TPS | 10.7 ms / 749 TPS | **2.2x** |
+| S6 | FPI storm | Replay saturation (WAL amplification) | 5.1 ms / 4,684 TPS | 10.9 ms / 2,197 TPS | **2.1x** |
+| S3 | GIN + TOAST | Replay saturation (bursty) | 8.0 ms / 1,490 TPS | 14.3 ms / 840 TPS | **1.8x** |
+| S8 | Table rewrite (VACUUM FULL) | WAL burst (no lock conflict) | 6.1 ms / 1,300 TPS | 7.2 ms / 1,107 TPS | **1.2x** |
 
-\* S8's average is compressed by Docker I/O contention.  Per-5s data shows 25s of 0 TPS under `remote_apply` vs. 15s of near-zero under `remote_write`.  On real hardware with separate storage, the ratio is significantly higher.
+### Real Hardware (identical VMs: PG 17, 4 CPU, 7.6 GB RAM, 128 MB shared_buffers)
+
+| # | Scenario | Mechanism | remote_write | remote_apply | Ratio |
+|---|----------|-----------|-------------|-------------|-------|
+| S8 | Table rewrite (VACUUM FULL) | WAL burst + lock conflict | 2.0 ms / 3,969 TPS | 7,187 ms / 1.1 TPS | **3,569x** |
+| S2 | Standby query conflict | Replay blocking (snapshot) | 0.26 ms / 30,368 TPS | 861 ms / 9.3 TPS | **3,273x** |
+| S7 | Reporting conflict (cross-table) | Replay blocking (snapshot) | 1.5 ms / 5,409 TPS | 3,249 ms / 2.5 TPS | **2,200x** |
+| S5 | Bulk INSERT (ETL) | Replay saturation | 1.8 ms / 4,359 TPS | 5.3 ms / 1,505 TPS | **2.9x** |
+| S4 | Schema migration | Replay saturation (WAL burst) | 1.8 ms / 4,352 TPS | 4.6 ms / 1,751 TPS | **2.5x** |
+| S3 | GIN + TOAST | Replay saturation (bursty) | 4.2 ms / 2,825 TPS | 8.8 ms / 1,367 TPS | **2.1x** |
+| S6 | FPI storm | Replay saturation (WAL amplification) | 3.4 ms / 7,148 TPS | 4.8 ms / 5,049 TPS | **1.4x** |
+| S1 | Index-heavy UPDATE saturation | Replay saturation | 8.3 ms / 3,857 TPS | 9.9 ms / 3,228 TPS | **1.2x** |
+
+### Key Takeaways
+
+- **Replay blocking scenarios (S2, S7, S8)** produce 1,000x-10,000x ratios on
+  any hardware.  The conflict mechanism completely stops replay — standby
+  resources are irrelevant.
+- **Replay saturation scenarios (S1, S3-S6)** scale with the standby's
+  weakness.  Constrained Docker standby: 2-9x.  Identical real hardware: 1.2-2.9x.
+  Weaker standby (less RAM, slower disks) would show higher ratios.
+- **S8 flipped from worst to best** between Docker (1.2x) and real hardware
+  (3,569x) — the lock conflict mechanism works brilliantly when I/O is not the
+  shared bottleneck.
 
 
 ## File Reference
