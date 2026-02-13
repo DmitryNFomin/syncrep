@@ -1,0 +1,66 @@
+name: syncrep
+
+services:
+  primary:
+    image: postgres:16
+    container_name: syncrep-primary
+    hostname: primary
+    environment:
+      POSTGRES_DB: bench
+      POSTGRES_HOST_AUTH_METHOD: trust
+    volumes:
+      - primary_data:/var/lib/postgresql/data
+      - ./primary/init.sh:/docker-entrypoint-initdb.d/01-replication.sh
+      - ..:/bench:ro
+    # NOTE: synchronous_standby_names and synchronous_commit are set via
+    # ALTER SYSTEM in init.sh — they cannot be in the command because the
+    # Docker entrypoint starts a temp server for init (CREATE DATABASE etc.)
+    # and with sync_standby_names='*' + no standby, those DDLs deadlock.
+    command: >-
+      postgres
+      -c wal_level=replica
+      -c max_wal_senders=10
+      -c max_replication_slots=10
+      -c wal_keep_size=1GB
+      -c shared_buffers=256MB
+      -c work_mem=16MB
+      -c max_wal_size=2GB
+      -c checkpoint_timeout=15min
+      -c log_min_messages=warning
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    ports:
+      - "15432:5432"
+
+  standby:
+    image: postgres:16
+    container_name: syncrep-standby
+    hostname: standby
+    environment:
+      PGDATA: /var/lib/postgresql/data
+    volumes:
+      - standby_data:/var/lib/postgresql/data
+      - ./standby/entrypoint.sh:/standby-entrypoint.sh
+      - ..:/bench:ro
+    entrypoint: ["bash", "/standby-entrypoint.sh"]
+    depends_on:
+      primary:
+        condition: service_healthy
+    # Constrain the standby to simulate a weaker replica node.
+    # The single-threaded startup process must do all replay on 0.5 CPU,
+    # and 384 MB total memory caps the OS page cache — forcing real I/O
+    # on the 3+ GB working set that doesn't fit in 48 MB shared_buffers.
+    deploy:
+      resources:
+        limits:
+          cpus: '0.50'
+          memory: 384M
+    ports:
+      - "15433:5432"
+
+volumes:
+  primary_data:
+  standby_data:
