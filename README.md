@@ -574,7 +574,9 @@ is ~2 KB.  Total table size with TOAST and GIN indexes: ~15 GB.
 ### Workload
 
 Mixed: 70% INSERT (new tickets with large bodies) / 30% UPDATE (rewrite body
-+ metadata on existing tickets).  12 concurrent clients.
++ metadata on existing tickets).  12 concurrent clients.  Weights are set via
+pgbench's `-f script.sql@N` syntax (e.g., `workload_insert.sql@7`,
+`workload_update.sql@3`).
 
 ### What to Expect
 
@@ -1407,6 +1409,53 @@ psql -c "SELECT replay_lag, pg_wal_lsn_diff(sent_lsn, replay_lsn) AS lag_bytes
 pgbench -f scenario2_blocked_conflict/workload_steady.sql \
     -c 8 -j 4 -T 30 -P 5 --no-vacuum bench
 ```
+
+### Scenario 3 on Real Hardware (GIN + TOAST)
+
+```bash
+# 1. Load data on PRIMARY
+psql -d bench -f scenario3_gin_toast/setup.sql
+
+# 2. Wait for standby to catch up
+while [ "$(psql -tAc "SELECT pg_wal_lsn_diff(sent_lsn, replay_lsn)::bigint
+    FROM pg_stat_replication;")" -gt 65536 ]; do sleep 1; done
+
+# --- Helper: run the test for a given mode ---
+run_s3() {
+    local MODE=$1
+    psql -c "ALTER SYSTEM SET synchronous_commit = '$MODE';"
+    psql -c "SELECT pg_reload_conf();"
+    psql -c "CHECKPOINT;"
+    sleep 2
+
+    # NOTE: pgbench weight syntax is -f file@weight (PG 14+).
+    # Older docs/examples may show -f file -w N, which is NOT valid.
+    pgbench --no-vacuum bench \
+        -f scenario3_gin_toast/workload_insert.sql@7 \
+        -f scenario3_gin_toast/workload_update.sql@3 \
+        -c 12 -j 6 -T 60 -P 5 --progress-timestamp \
+        2>&1 | tee results/s3_${MODE}.log
+
+    # Flush GIN pending lists
+    psql -d bench -c "SET synchronous_commit TO local; VACUUM tickets;"
+
+    # Wait for catchup before next mode
+    while [ "$(psql -tAc "SELECT pg_wal_lsn_diff(sent_lsn, replay_lsn)::bigint
+        FROM pg_stat_replication;")" -gt 65536 ]; do sleep 1; done
+}
+
+# 3. Run both modes
+run_s3 remote_write
+run_s3 remote_apply
+
+# 4. Compare
+grep 'latency average' results/s3_remote_write.log results/s3_remote_apply.log
+grep '^tps' results/s3_remote_write.log results/s3_remote_apply.log
+```
+
+> **pgbench weight syntax**: PostgreSQL 14+ uses `-f script.sql@N` to assign
+> relative weights to scripts.  The `-w` flag seen in some older examples is
+> **not valid** and will produce `invalid option -- 'w'`.
 
 ### Scenario 4 on Real Hardware (Schema Migration)
 
