@@ -1323,15 +1323,36 @@ recovery_prefetch = off             # optional: makes saturation easier to trigg
 shared_buffers = 128MB              # smaller than primary to stress replay cache
 ```
 
+### Cross-Datacenter Setup
+
+For cross-datacenter benchmarks (e.g., Nuremberg ↔ Helsinki, ~24ms RTT):
+
+1. **`synchronous_commit = local` for all setup operations** is critical — loading
+   2M rows with sync commit across 24ms RTT would take forever
+2. **Standby `pg_hba.conf`** must allow SQL connections from the primary IP for
+   standby blocker queries (S2, S7, S8):
+   ```
+   host    bench    postgres    <primary_ip>/32    trust
+   ```
+3. **`max_wal_size = 4GB`** and **`checkpoint_timeout = 15min`** on primary to
+   avoid checkpoints during scenarios
+4. Copy scenario files to `/tmp/syncrep` (not `/root/` — postgres user needs read access)
+5. Run: `bash /tmp/syncrep/run_on_vms.sh`
+
+The script automatically switches between `remote_write` and `remote_apply`
+for each scenario and reports both ratio and **added latency** (the pure replay
+overhead).
+
 ### On Real Hardware, You Don't Need Docker Constraints If:
 
 - **The standby has less RAM**: A standby with 4 GB RAM and a 10+ GB working
   set will naturally have cache misses.
 - **The standby has slower disks**: Spinning disks or SATA SSDs vs. the
   primary's NVMe will bottleneck replay I/O.
-- **Network latency**: Cross-datacenter (1-10ms RTT) adds to both modes, but
-  replay time is additive — `remote_apply` latency = network RTT + replay
-  time.
+- **Network latency**: Cross-datacenter (~24ms RTT in our Nuremberg↔Helsinki
+  test) adds to both modes, but replay time is additive —
+  `remote_apply` latency = network RTT + replay time.  Use "added latency"
+  (apply − write) to isolate the pure replay cost.
 - **The standby serves read queries**: CPU and I/O consumed by queries
   compete with the startup process.
 
@@ -1852,17 +1873,54 @@ storage compresses the difference.
 | S6 | FPI storm | Replay saturation (WAL amplification) | 3.4 ms / 7,148 TPS | 4.8 ms / 5,049 TPS | **1.4x** |
 | S1 | Index-heavy UPDATE saturation | Replay saturation | 8.3 ms / 3,857 TPS | 9.9 ms / 3,228 TPS | **1.2x** |
 
+### Cross-Datacenter (PG 18, Nuremberg ↔ Helsinki, ~24ms RTT)
+
+| Primary | Replica | Network RTT | PG Version |
+|---------|---------|-------------|------------|
+| 46.225.179.227 (Nuremberg) | 89.167.39.203 (Helsinki) | ~24 ms | 18.2 |
+| 4 CPU, 7.6 GB RAM | 4 CPU, 7.6 GB RAM | | |
+
+**Why "added latency" is the right metric here:**
+
+With ~24ms network RTT, both `remote_write` and `remote_apply` include the
+same base cost: query execution time + network round-trip.  The difference
+between them — `added_latency = remote_apply − remote_write` — isolates the
+pure **replay overhead** on the standby.  This makes it a cleaner measure than
+the ratio, which is compressed by the large shared base (the ~24ms RTT).
+
+| # | Scenario | Mechanism | remote_write | remote_apply | Added Latency | Ratio |
+|---|----------|-----------|-------------|-------------|---------------|-------|
+| S7 | Reporting conflict (cross-table) | Replay blocking (snapshot) | 26.2 ms / 305 TPS | 16,702 ms / 0.5 TPS | **+16,676 ms** | 638x |
+| S8 | Table rewrite (VACUUM FULL) | Lock conflict | 159.2 ms / 50 TPS | 12,847 ms / 0.6 TPS | **+12,688 ms** | 80.7x |
+| S2 | Standby query conflict | Replay blocking (snapshot) | 3.3 ms / 2,396 TPS | 2,399 ms / 3.3 TPS | **+2,396 ms** | 719x |
+| S5 | Bulk INSERT (ETL) | Replay saturation | 30.2 ms / 265 TPS | 82.1 ms / 97 TPS | **+51.9 ms** | 2.7x |
+| S4 | Schema migration | Replay saturation (WAL burst) | 41.9 ms / 191 TPS | 51.6 ms / 155 TPS | **+9.7 ms** | 1.2x |
+| S6 | FPI storm | Replay saturation (WAL amplification) | 29.1 ms / 825 TPS | 33.9 ms / 707 TPS | **+4.9 ms** | 1.2x |
+| S3 | GIN + TOAST | Replay saturation (bursty) | 30.7 ms / 390 TPS | 34.4 ms / 349 TPS | **+3.6 ms** | 1.1x |
+| S1 | Index-heavy UPDATE saturation | Replay saturation | 31.6 ms / 1,013 TPS | 31.5 ms / 1,015 TPS | **−0.1 ms** | 1.0x |
+
 ### Key Takeaways
 
-- **Replay blocking scenarios (S2, S7, S8)** produce 1,000x-10,000x ratios on
-  any hardware.  The conflict mechanism completely stops replay — standby
-  resources are irrelevant.
-- **Replay saturation scenarios (S1, S3-S6)** scale with the standby's
-  weakness.  Constrained Docker standby: 2-9x.  Identical real hardware: 1.2-2.9x.
-  Weaker standby (less RAM, slower disks) would show higher ratios.
-- **S8 flipped from worst to best** between Docker (1.2x) and real hardware
-  (3,569x) — the lock conflict mechanism works brilliantly when I/O is not the
-  shared bottleneck.
+- **Replay blocking scenarios (S2, S7, S8)** add **seconds** of latency on any
+  hardware. The conflict mechanism completely stops replay — added latency equals
+  the full duration of the standby blocker query.
+- **S7 is the worst case (+16.7 seconds)**: a single reporting query on a
+  _different_ table freezes writes to _all_ tables.  This is the most dangerous
+  production scenario — it's invisible until you measure it.
+- **S5 bulk load (+52ms)** shows that heavy WAL from ETL/batch jobs adds
+  meaningful latency even without conflicts.  The standby's single-threaded
+  replay simply cannot keep up with 2M indexed inserts.
+- **Saturation scenarios (S1, S3-S6)** add 0-52ms depending on WAL volume.
+  On identical hardware with ~24ms RTT, the ratio looks small (1.0-2.7x) because
+  the network base dominates — but the **absolute added latency** reveals the
+  real cost.
+- **S1 shows zero added latency** (−0.1ms): when both VMs are identical and the
+  standby can keep up with replay, `remote_apply` costs nothing extra.  This
+  confirms that the overhead only appears when the standby is actually behind.
+- **Cross-datacenter ratios appear lower** than same-datacenter because ~24ms RTT
+  inflates the `remote_write` baseline.  Same-datacenter S7 showed 2,200x;
+  cross-datacenter shows 638x — but the added latency is similar (~16.7s vs ~3.2s,
+  the difference being the longer blocker query duration).
 
 
 ## File Reference
@@ -1872,6 +1930,7 @@ syncrep/
 ├── README.md                          ← this file
 ├── validate.sh                        ← automated Docker test runner (S1-S3)
 ├── validate_new.sh                    ← automated Docker test runner (S4-S8)
+├── run_on_vms.sh                      ← runner for real VMs (all 8 scenarios)
 ├── docker/
 │   ├── docker-compose.yml             ← two-node cluster definition
 │   ├── primary/init.sh                ← enables sync rep via ALTER SYSTEM

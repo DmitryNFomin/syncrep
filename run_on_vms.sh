@@ -12,7 +12,7 @@
 #   - scenario files in /root/syncrep/
 set -euo pipefail
 
-STANDBY_HOST="46.225.119.93"
+STANDBY_HOST="89.167.39.203"
 PSQL="sudo -u postgres psql -d bench -v ON_ERROR_STOP=1"
 PSQL_S="sudo -u postgres psql -h $STANDBY_HOST -d bench"
 SQL_DIR="/tmp/syncrep"
@@ -98,10 +98,12 @@ print_comparison() {
     printf "  %-20s %12s %12s\n"   "TPS"              "$tps_rw"     "$tps_ra"
 
     if [ -n "$lat_rw" ] && [ -n "$lat_ra" ]; then
-        local ratio
+        local added ratio
+        added=$(awk "BEGIN {printf \"%.1f\", $lat_ra - $lat_rw}")
         ratio=$(awk "BEGIN {printf \"%.1f\", $lat_ra / $lat_rw}")
         echo ""
-        echo -e "  Latency ratio (apply/write): ${BOLD}${ratio}x${NC}"
+        echo -e "  ${BOLD}Added latency (apply − write): +${added} ms${NC}"
+        echo -e "  Latency ratio: ${ratio}x"
         if awk "BEGIN {exit !($lat_ra > $lat_rw * $pass_threshold)}"; then
             echo -e "  ${GREEN}PASS${NC} — remote_apply latency is measurably higher"
         else
@@ -433,8 +435,8 @@ scenario6() {
     done
 
     # Restore
-    log "Restoring checkpoint_timeout = 5min..."
-    $PSQL -c "ALTER SYSTEM SET checkpoint_timeout = '5min';" >/dev/null
+    log "Restoring checkpoint_timeout = 15min..."
+    $PSQL -c "ALTER SYSTEM SET checkpoint_timeout = '15min';" >/dev/null
     $PSQL -c "SELECT pg_reload_conf();" >/dev/null
 
     print_comparison "SCENARIO 6" "$RESULTS_DIR/s6_remote_write.log" \
@@ -640,19 +642,26 @@ main() {
     # Final summary
     hdr "OVERALL SUMMARY (scenarios ${scenarios[*]})"
     echo ""
+    printf "  %-4s %14s %14s %14s %8s\n" "" "remote_write" "remote_apply" "added_latency" "ratio"
+    printf "  %-4s %14s %14s %14s %8s\n" "" "(ms)" "(ms)" "(ms)" ""
+    echo "  ─────────────────────────────────────────────────────────────────"
     for S_NUM in "${scenarios[@]}"; do
-        for MODE in remote_write remote_apply; do
-            local f="$RESULTS_DIR/s${S_NUM}_${MODE}.log"
-            if [ -f "$f" ]; then
-                local lat tps
-                lat=$(extract_avg_latency "$f")
-                tps=$(extract_tps "$f")
-                printf "  S%d %-14s  lat=%8s ms  tps=%8s\n" "$S_NUM" "$MODE" "$lat" "$tps"
+        local rw_f="$RESULTS_DIR/s${S_NUM}_remote_write.log"
+        local ra_f="$RESULTS_DIR/s${S_NUM}_remote_apply.log"
+        if [ -f "$rw_f" ] && [ -f "$ra_f" ]; then
+            local lat_rw lat_ra added ratio
+            lat_rw=$(extract_avg_latency "$rw_f")
+            lat_ra=$(extract_avg_latency "$ra_f")
+            if [ -n "$lat_rw" ] && [ -n "$lat_ra" ]; then
+                added=$(awk "BEGIN {printf \"%.1f\", $lat_ra - $lat_rw}")
+                ratio=$(awk "BEGIN {printf \"%.1f\", $lat_ra / $lat_rw}")
+                printf "  S%-3d %14s %14s %+13.1f %7sx\n" "$S_NUM" "$lat_rw" "$lat_ra" "$added" "$ratio"
             fi
-        done
-        echo ""
+        fi
     done
-
+    echo ""
+    echo -e "  ${BOLD}added_latency = remote_apply − remote_write = pure replay overhead${NC}"
+    echo ""
     echo -e "${BOLD}See per-5s progress lines in $RESULTS_DIR/ for latency spikes.${NC}"
     echo ""
     log "Done."
