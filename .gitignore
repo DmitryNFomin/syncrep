@@ -1,1 +1,4 @@
 results/
+infra/hetzner.conf
+infra/hetzner.env
+syncrep.conf

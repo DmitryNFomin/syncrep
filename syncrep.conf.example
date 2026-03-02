@@ -1,0 +1,36 @@
+# syncrep.conf — connection settings for Patroni-managed cluster
+#
+# Copy to syncrep.conf, fill in your values, then:
+#   source syncrep.conf && bash setup_patroni_env.sh   # once
+#   source syncrep.conf && bash run.sh                 # each run
+#
+# The conf file is sourced by both setup_patroni_env.sh and run.sh, so
+# keep it as a plain key=value shell file with no subshells.
+
+# Primary host/port.  Use the Patroni primary VIP or the direct host.
+# Must NOT be a load-balancer that can route to a replica.
+PRIMARY_HOST="10.0.1.10"
+PRIMARY_PORT="5432"
+
+# Standby host/port.  Use one specific replica, NOT the read-only VIP
+# (load-balancing would split connections across replicas and make lag
+# measurements meaningless).
+STANDBY_HOST="10.0.1.11"
+STANDBY_PORT="5432"
+
+# PostgreSQL user.  Needs SUPERUSER (or at minimum: CREATEDB, REPLICATION,
+# and the ability to ALTER SYSTEM on both nodes).
+PGUSER="postgres"
+
+# Password — leave empty to rely on ~/.pgpass or peer/ident auth.
+PGPASSWORD=""
+
+# Database used for all benchmarks.  Will be created by setup_patroni_env.sh.
+PGDATABASE="bench"
+
+# Absolute path to the syncrep scenario directory.
+# Default: directory containing this file.  Override if you symlinked.
+SQL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Where pgbench log files land.
+RESULTS_DIR="/tmp/syncrep_results"

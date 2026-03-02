@@ -1,0 +1,52 @@
+# hetzner.conf — Hetzner Cloud provisioning settings for syncrep benchmark
+#
+# Copy this file to infra/hetzner.conf and fill in the required values:
+#   cp infra/hetzner.conf.example infra/hetzner.conf
+#   $EDITOR infra/hetzner.conf
+#
+# hetzner.conf is gitignored (it contains your API token). Never commit it.
+# After filling in values, run:
+#   bash infra/hetzner_create.sh   # provisions dmitry1 + dmitry2
+#   bash infra/init_cluster.sh     # installs PG 18 + Patroni, forms cluster
+
+# ── Required ─────────────────────────────────────────────────────────────────
+
+# Hetzner Cloud API token.  Create one at:
+#   https://console.hetzner.cloud → project → Security → API Tokens → Generate
+HCLOUD_TOKEN=""
+
+# Name of an SSH key already registered in your Hetzner project.
+# Check available keys with: hcloud ssh-key list
+SSH_KEY_NAME=""
+
+# ── Server configuration ──────────────────────────────────────────────────────
+
+# Server type.  cx32 = 4 shared vCPU, 8 GB RAM, 80 GB NVMe (~0.017 €/h).
+# Other options: cx22 (2 vCPU/4 GB), cx42 (8 vCPU/16 GB), cpx31 (4 ded. vCPU).
+# Run `hcloud server-type list` to see all types.
+SERVER_TYPE="cx32"
+
+# Datacenter for both VMs.  Both must be in the same datacenter so the
+# private network has minimal latency (<1 ms intra-DC RTT).
+# Options: fsn1-dc14 (Falkenstein), nbg1-dc3 (Nuremberg), hel1-dc2 (Helsinki),
+#          ash-dc1 (Ashburn, US), hil-dc1 (Hillsboro, US), sin-dc1 (Singapore)
+DATACENTER="fsn1-dc14"
+
+# OS image.  Ubuntu 24.04 LTS is required: setup_node.sh uses apt-get and
+# PEP 668 pip flags specific to Debian/Ubuntu 24.04.
+IMAGE="ubuntu-24.04"
+
+# ── PostgreSQL / Patroni ──────────────────────────────────────────────────────
+
+# PostgreSQL major version to install from the PGDG apt repo.
+PGVER="18"
+
+# PostgreSQL superuser (postgres) password.  Used by Patroni and benchmarks.
+PGPASSWORD="benchpass"
+
+# Password for the 'replicator' replication user created by Patroni.
+REPLICATOR_PASSWORD="replpass"
+
+# Patroni cluster scope name.  Used as the Raft namespace prefix and in
+# `patronictl list` output.  Stick to [a-z0-9_-], no spaces.
+CLUSTER_NAME="syncrep"
