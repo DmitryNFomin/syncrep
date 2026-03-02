@@ -62,6 +62,31 @@ Under `remote_write`, none of this matters — the primary only waits for the
 WAL bytes to reach the standby's memory. Under `remote_apply`, every extra
 millisecond of replay adds directly to commit latency.
 
+### Latency sources at a glance
+
+| Scenario | Mechanism | Magnitude | `hsf=on` fixes it? |
+|----------|-----------|-----------|---------------------|
+| S2 Snapshot conflict | Replay stall (snapshot) | **20×** | Yes |
+| S7 Cross-table blast | Replay stall (snapshot) | **350×** | Yes |
+| S8 VACUUM FULL lock | Replay stall (lock) | **170×** | **No** |
+| S9 Buffer pin | Replay stall (buffer pin) | ~5 ms | **No** |
+| S13 Hash VACUUM | Replay stall (snapshot + pin) | ~1 ms | Mostly |
+| S10 Large UPDATE | WAL replay throughput | ~350 ms | **No** |
+| S12 Logical rewrite | pg_fsync per rewrite record | ~70 ms | **No** |
+| S11 DROP partitions | unlink() per file on replay | ~50 ms | **No** |
+| S4 CREATE INDEX | Index build on replay | ~17 ms | **No** |
+| S5 Bulk INSERT | WAL replay throughput | ~15 ms | **No** |
+| S6 FPI storm | WAL volume (full-page images) | ~10 ms | **No** |
+| S1 Normal OLTP | Baseline RTT + replay | ~5 ms | — |
+| S3 GIN/TOAST | WAL volume (bursty records) | ~1 ms | — |
+
+**Key insight**: `hot_standby_feedback = on` prevents only snapshot conflicts
+(S2, S7, S13). Lock conflicts (S8), buffer-pin stalls (S9), and all
+non-conflict replay overhead (S4–S6, S10–S12) are unaffected — because they
+have nothing to do with row visibility. See [Effect of
+`hot_standby_feedback`](#effect-of-hot_standby_feedback) for the full
+tradeoff including the bloat cost.
+
 ---
 
 ## Prerequisites
