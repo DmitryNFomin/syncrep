@@ -72,11 +72,13 @@ millisecond of replay adds directly to commit latency.
 | S9 Buffer pin | Replay stall (buffer pin) | ~5 ms | **No** |
 | S13 Hash VACUUM | Replay stall (snapshot + pin) | ~1 ms | Mostly |
 | S10 Large UPDATE | WAL replay throughput | ~350 ms | **No** |
-| S12 Logical rewrite | pg_fsync per rewrite record | ~70 ms | **No** |
-| S11 DROP partitions | unlink() per file on replay | ~50 ms | **No** |
+| S15 Anti-wraparound VACUUM | WAL volume (FREEZE + FPI) | **hours at 1 TB** | **No** |
+| S12 Logical rewrite | pg_fsync per rewrite record | scales with rows | **No** |
+| S11 DROP partitions | unlink() per file on replay | scales with N parts | **No** |
+| S14 Replay saturation | WAL gen > single-thread replay | grows with CPU count | **No** |
 | S4 CREATE INDEX | Index build on replay | ~17 ms | **No** |
 | S5 Bulk INSERT | WAL replay throughput | ~15 ms | **No** |
-| S6 FPI storm | WAL volume (full-page images) | ~10 ms | **No** |
+| S6 FPI storm | WAL volume (full-page images) | **minutes at 75 GB shbuf** | **No** |
 | S1 Normal OLTP | Baseline RTT + replay | ~5 ms | — |
 | S3 GIN/TOAST | WAL volume (bursty records) | ~1 ms | — |
 
@@ -256,6 +258,11 @@ throughput becomes the bottleneck.
 
 **Typical result**: +5–15 ms during the FPI burst
 
+**Scale**: effect grows directly with `shared_buffers`. At 75 GB
+`shared_buffers` (typical for a 300 GiB server), a post-checkpoint FPI storm
+can generate 10–75 GB of WAL. At 300 MB/s replay throughput: 30–250 seconds
+of stall for every `remote_apply` commit during that window.
+
 ---
 
 ### S7 — Reporting query blocks replay (cross-table blast radius)
@@ -312,6 +319,10 @@ elevated stddev and tail latency.
 
 **Typical result**: +3–10 ms average; effect is stronger in p99
 
+**Scale**: more pages = more FREEZE_PAGE records = more pin collision
+opportunities per VACUUM FREEZE pass. For the pure WAL-volume aspect of
+anti-wraparound at production scale, see S15.
+
 ---
 
 ### S10 — Large synchronous UPDATE
@@ -349,6 +360,10 @@ single commit replay. The primary waits for all of them under `remote_apply`.
 
 **Typical result**: +40–60 ms (scales with partition count)
 
+**Scale**: unlink count ≈ partitions × (heap + FSM + VM + index forks).
+10,000 partitions → ~100,000 unlinks. At ~0.1 ms each on a loaded filesystem:
+10+ seconds of `remote_apply` stall per DROP.
+
 ---
 
 ### S12 — VACUUM FULL with logical replication slot
@@ -370,6 +385,10 @@ this means ~300 individual fsyncs during replay of a single VACUUM FULL commit.
 
 **Typical result**: +60–100 ms per VACUUM FULL; scales with table size and
 row count
+
+**Scale**: fsyncs ≈ rows / rows_per_page. A 100M-row table generates ~100,000
+fsyncs during replay of a single VACUUM FULL commit — seconds to minutes of
+`remote_apply` stall every time the table is vacuumed.
 
 ---
 
@@ -394,6 +413,81 @@ theoretically more aggressive but in practice the overlap window is small
 
 ---
 
+### S14 — Replay throughput saturation (high-concurrency ceiling)
+
+**What**: pgbench runs the same write-heavy workload at increasing concurrency
+levels (1 → 2 → 4 → 8 → 16 → 32 clients). Each transaction updates a wide row,
+generating ~3–5 KB of WAL. Latency is recorded at each level for both sync
+modes.
+
+**Mechanism**: WAL replay is **single-threaded**. The startup process on the
+standby can apply roughly 200–500 MB/s of WAL (NVMe). As primary concurrency
+increases, WAL generation rate climbs. Once generation approaches replay
+throughput, each new commit must wait in queue behind earlier commits whose WAL
+hasn't been replayed yet.
+
+Under `remote_write`, this queue is invisible — the primary only waits for WAL
+bytes to reach standby memory, which happens concurrently with replay. Under
+`remote_apply`, the queue directly adds to each commit's latency. The result:
+`remote_apply` latency grows with concurrency; `remote_write` stays flat.
+
+**What to look for**: a table with concurrency vs latency for both modes.
+Growing `added_ms` as client count rises = replay queue forming. Flat
+`added_ms` = replay keeps up; all overhead is network RTT.
+
+**On small VMs**: WAL generation rate is bounded by the small CPU count; replay
+keeps up and divergence is modest. The scenario demonstrates the trend and
+mechanism.
+
+**Scale**: a 128-CPU server running thousands of TPS can generate 1+ GB/s of
+WAL. At that point replay can't keep up and every `remote_apply` commit waits
+for an ever-growing queue. This failure mode does not exist under `remote_write`
+at all.
+
+**Typical result**: growing divergence at high concurrency; magnitude depends
+on server size and WAL-per-transaction
+
+---
+
+### S15 — Anti-wraparound VACUUM (large WAL volume, zero conflicts)
+
+**What**: Simulates PostgreSQL's anti-wraparound autovacuum on a 700 MB table
+(2M rows). A `CHECKPOINT` is forced immediately before `VACUUM FREEZE` to
+trigger full-page images (FPI) on every page — matching the WAL density of a
+production anti-wraparound event. No standby queries run; this is purely a
+replay throughput test.
+
+**Mechanism**: `VACUUM FREEZE` writes `XLOG_HEAP2_FREEZE_PAGE` for every table
+page that contains unfrozen tuples. With a preceding checkpoint, each of those
+writes also carries an 8 KB full-page image — amplifying WAL volume to
+roughly the on-disk table size. For a 700 MB table this means ~700 MB of WAL
+from a single VACUUM FREEZE.
+
+Under `remote_write`, the commit returns instantly; replay runs in the
+background. Under `remote_apply`, the primary blocks until the standby has
+replayed all ~700 MB of FREEZE_PAGE + FPI records.
+
+**Why this matters in production**: anti-wraparound autovacuum is triggered
+automatically when a table's `relfrozenxid` approaches `autovacuum_freeze_max_age`
+(default 200M transactions). It bypasses `autovacuum_vacuum_cost_delay` (full
+speed, no throttling) and **cannot be cancelled** — autovacuum relaunches it
+immediately. On long-lived tables it is a recurring, unavoidable event.
+
+**Typical result**: `remote_apply` stall ≈ WAL_volume / replay_throughput.
+For this scenario (~700 MB WAL): a few seconds. No conflict involved.
+
+**Scale**:
+
+| Table size | FPI WAL | Replay at 300 MB/s | `remote_apply` stall |
+|------------|---------|---------------------|----------------------|
+| 100 GB | ~100 GB | ~5 min | **5 min per anti-wraparound** |
+| 1 TB | ~1 TB | ~55 min | **55 min per anti-wraparound** |
+| 10 TB | ~10 TB | ~9 h | **9 hours per anti-wraparound** |
+
+Every `remote_apply` commit issued during that window waits.
+
+---
+
 ## Effect of `hot_standby_feedback`
 
 | Scenario | Type | `hsf=off` | `hsf=on` |
@@ -406,6 +500,8 @@ theoretically more aggressive but in practice the overlap window is small
 | S12 Logical rewrite fsyncs | I/O overhead | adds ms | **no effect** |
 | S10 Large UPDATE | replay throughput | adds ms | **no effect** |
 | S11 DROP partitions | fs ops on replay | adds ms | **no effect** |
+| S14 Replay saturation | WAL gen > replay rate | grows with concurrency | **no effect** |
+| S15 Anti-wraparound VACUUM | WAL volume (FREEZE+FPI) | hours at 1 TB scale | **no effect** |
 
 `hot_standby_feedback = on` prevents snapshot conflicts by advertising the
 standby's oldest active xmin to the primary, causing VACUUM to skip rows that
@@ -457,7 +553,7 @@ run.sh                        run all scenarios (or a range)
 report.sh                     parse result files → summary table
 setup_patroni_env.sh          pre-flight cluster health check
 
-scenario*/                    SQL files for each scenario
+scenario{1-15}*/              SQL files for each scenario
   setup.sql                   table creation and data loading
   workload.sql                pgbench transaction script
   standby_*.sql               queries run on the standby (blockers/scanners)

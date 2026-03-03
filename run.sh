@@ -411,6 +411,11 @@ scenario6() {
     echo "  Strategy: checkpoint_timeout=30s + random scattered UPDATEs."
     echo "  After each checkpoint, every page touch generates 8KB FPI."
     echo ""
+    echo "  SCALE: effect grows directly with shared_buffers size."
+    echo "  At shared_buffers=75 GB (typical on a 300 GiB server), a checkpoint"
+    echo "  FPI storm can generate 10-75 GB of WAL in seconds. Replay at 300 MB/s"
+    echo "  takes 30-250 seconds — all remote_apply commits stall for the duration."
+    echo ""
 
     set_sync_mode "local"
     log "Loading data (2M rows, fillfactor=50 — takes ~30s)..."
@@ -627,6 +632,10 @@ scenario9() {
     echo "  Stalls are amplified by CHECKPOINT-induced FPIs (each frozen page"
     echo "  also gets an 8KB full-page image after the preceding CHECKPOINT)."
     echo ""
+    echo "  SCALE: effect grows with table size. More pages = more FREEZE_PAGE"
+    echo "  records + FPIs = more pin collision opportunities per VACUUM FREEZE."
+    echo "  For the pure WAL-volume aspect of anti-wraparound at scale, see S15."
+    echo ""
 
     set_sync_mode "local"
     log "Loading freeze_test (300K rows, ~60 MB — takes ~15s)..."
@@ -787,6 +796,10 @@ scenario11() {
     echo "  remote_write: commit instant after DROP finishes on primary."
     echo "  remote_apply: waits for XLogFlush + ~500 durable_unlink() syscalls."
     echo ""
+    echo "  SCALE: unlink count ≈ partitions × (heap+FSM+VM+index forks)."
+    echo "  10,000 partitions → ~100,000 unlinks. At ~0.1 ms each on a loaded"
+    echo "  filesystem: 10+ seconds of remote_apply stall per DROP."
+    echo ""
 
     # Wall-clock timing for this scenario (not pgbench)
     for MODE in remote_write remote_apply; do
@@ -846,6 +859,10 @@ scenario12() {
     echo "  Without a logical slot: no XLOG_HEAP2_REWRITE records are written;"
     echo "  VACUUM FULL commits at the same speed under both modes."
     echo "  With a logical slot: remote_apply must absorb N fsyncs of pure overhead."
+    echo ""
+    echo "  SCALE: fsyncs ≈ rows / rows_per_page. A 100M-row table generates"
+    echo "  ~100,000 fsyncs during replay — seconds to minutes of stall per"
+    echo "  VACUUM FULL when a logical slot exists."
     echo ""
 
     # Check prerequisite
@@ -994,6 +1011,175 @@ scenario13() {
                      "$RESULTS_DIR/s13_remote_apply.log" 3.0
 }
 
+# ══════════════════════════════════════════════════════════════════════════════
+# SCENARIO 14: Replay throughput saturation — single-threaded replay ceiling
+# ══════════════════════════════════════════════════════════════════════════════
+scenario14() {
+    hdr "SCENARIO 14: Replay throughput saturation — single-threaded replay ceiling"
+    echo "  Mechanism: WAL replay is single-threaded (one startup process)."
+    echo "  remote_write: primary waits only for WAL bytes to reach standby memory."
+    echo "  remote_apply: every commit competes for the same single replay thread."
+    echo ""
+    echo "  As concurrency rises, WAL generation rate climbs. Once it approaches"
+    echo "  replay throughput, commits queue behind the replay process."
+    echo "  remote_apply latency grows with concurrency; remote_write stays flat."
+    echo "  This is the hard ceiling remote_apply hits that remote_write does not:"
+    echo "  replay is the bottleneck, not the network."
+    echo ""
+    echo "  SCALE: a 128-CPU server can generate 1+ GB/s of WAL at peak TPS."
+    echo "  NVMe replay throughput is ~200-500 MB/s — saturation is guaranteed"
+    echo "  at high concurrency. On a small VM this scenario shows the trend;"
+    echo "  the full effect requires a many-CPU server to actually saturate replay."
+    echo ""
+
+    set_sync_mode "local"
+    log "Loading saturation_test (100K wide rows, ~50 MB — takes ~5s)..."
+    $PSQL -f "$SQL_DIR/scenario14_replay_saturation/setup.sql" >/dev/null 2>&1
+    set_sync_mode "remote_write"
+    wait_for_catchup 60
+
+    local -a LEVELS=(1 2 4 8 16 32)
+
+    for MODE in remote_write remote_apply; do
+        log "── $MODE ──"
+        set_sync_mode "$MODE"
+
+        for CLIENTS in "${LEVELS[@]}"; do
+            local THREADS
+            THREADS=$(( CLIENTS < 4 ? CLIENTS : 4 ))
+            log "pgbench concurrency=$CLIENTS clients (20s)..."
+            $PGBENCH \
+                -f "$SQL_DIR/scenario14_replay_saturation/workload.sql" \
+                -c "$CLIENTS" -j "$THREADS" -T 20 \
+                --no-vacuum 2>&1 \
+                | tee "$RESULTS_DIR/s14_${MODE}_c${CLIENTS}.log"
+            show_repl
+            wait_for_catchup 30
+        done
+
+        # Canonical log for report.sh = highest-concurrency run
+        cp "$RESULTS_DIR/s14_${MODE}_c32.log" "$RESULTS_DIR/s14_${MODE}.log"
+    done
+
+    hdr "SCENARIO 14 — RESULTS (avg latency ms vs concurrency)"
+    echo ""
+    printf "  %-8s  %14s  %14s  %10s\n" "clients" "remote_write" "remote_apply" "added_ms"
+    printf "  %-8s  %14s  %14s  %10s\n" "-------" "------------" "------------" "--------"
+    for CLIENTS in "${LEVELS[@]}"; do
+        local rw_lat ra_lat added
+        rw_lat=$(grep 'latency average' \
+            "$RESULTS_DIR/s14_remote_write_c${CLIENTS}.log" 2>/dev/null \
+            | head -1 | awk -F'= ' '{print $2}' | awk '{print $1}')
+        ra_lat=$(grep 'latency average' \
+            "$RESULTS_DIR/s14_remote_apply_c${CLIENTS}.log" 2>/dev/null \
+            | head -1 | awk -F'= ' '{print $2}' | awk '{print $1}')
+        if [ -n "$rw_lat" ] && [ -n "$ra_lat" ]; then
+            added=$(awk "BEGIN {printf \"%+.1f\", $ra_lat - $rw_lat}")
+            printf "  %-8s  %14s  %14s  %10s\n" "$CLIENTS" "$rw_lat" "$ra_lat" "$added"
+        else
+            printf "  %-8s  %14s  %14s  %10s\n" \
+                "$CLIENTS" "${rw_lat:-N/A}" "${ra_lat:-N/A}" "N/A"
+        fi
+    done
+    echo ""
+    echo "  Growing added_ms with client count = replay saturation onset."
+    echo "  Flat added_ms = replay keeps up; all overhead is network RTT."
+    echo "  On a 128-CPU/NVMe server the divergence point is 100s+ ms added."
+    echo ""
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SCENARIO 15: Anti-wraparound VACUUM — large WAL volume, zero conflicts
+# ══════════════════════════════════════════════════════════════════════════════
+scenario15() {
+    hdr "SCENARIO 15: Anti-wraparound VACUUM — large WAL volume, zero conflicts"
+    echo "  Mechanism: VACUUM FREEZE writes XLOG_HEAP2_FREEZE_PAGE for every page"
+    echo "  in the table regardless of whether any standby queries are running."
+    echo "  Anti-wraparound autovacuum bypasses cost delay and cannot be cancelled,"
+    echo "  generating WAL proportional to table size at full I/O speed."
+    echo ""
+    echo "  A CHECKPOINT immediately before VACUUM FREEZE causes it to emit a"
+    echo "  full-page image (8 KB) for every page it touches — amplifying WAL"
+    echo "  volume to match the on-disk table size. This mirrors production"
+    echo "  conditions where anti-wraparound fires after a recent checkpoint."
+    echo ""
+    echo "  remote_write: VACUUM FREEZE commit returns instantly; replay is async."
+    echo "  remote_apply: primary waits until standby replays ALL FREEZE_PAGE + FPI"
+    echo "  records before returning. No conflicts — pure replay throughput limit."
+    echo ""
+    echo "  SCALE:"
+    echo "    1 TB table  → ~130M pages → ~1 TB of FPI WAL per VACUUM FREEZE."
+    echo "    At 300 MB/s replay: ~55 minutes of remote_apply stall."
+    echo "    This is a recurring, automatic, unavoidable event on large tables."
+    echo ""
+
+    set_sync_mode "local"
+    log "Loading antiwrap_test (2M rows, ~700 MB — takes ~60s)..."
+    $PSQL -f "$SQL_DIR/scenario15_antiwrap_vacuum/setup.sql" >/dev/null 2>&1
+    set_sync_mode "remote_write"
+    wait_for_catchup 300
+
+    for MODE in remote_write remote_apply; do
+        log "── $MODE ──"
+
+        # Update 50% of rows to ensure unfrozen tuples exist.
+        # VACUUM FREEZE skips already-frozen tuples; we need live unfrozen work.
+        set_sync_mode "local"
+        log "Updating 50% of rows to create unfrozen tuples (local sync, ~30s)..."
+        $PSQL -c "UPDATE antiwrap_test
+                  SET payload = md5(id::text || 'x')
+                  WHERE id % 2 = 0;" >/dev/null
+
+        # CHECKPOINT forces a full-page image on the next write to every page,
+        # amplifying WAL volume to simulate production anti-wraparound density.
+        log "CHECKPOINT (forces FPIs on next VACUUM FREEZE — amplifies WAL)..."
+        $PSQL -c "CHECKPOINT;" >/dev/null
+        sleep 2
+
+        local lsn_before
+        lsn_before=$($PSQL -tAc "SELECT pg_current_wal_lsn();" 2>/dev/null \
+                     || echo "0/0")
+
+        set_sync_mode "$MODE"
+        log "Timing VACUUM FREEZE antiwrap_test (vacuum_freeze_min_age=0)..."
+        local t0_ms
+        t0_ms=$(date +%s%3N)
+        $PSQL -c "SET vacuum_freeze_min_age = 0" \
+              -c "VACUUM FREEZE antiwrap_test" >/dev/null
+        local elapsed_ms=$(( $(date +%s%3N) - t0_ms ))
+
+        local wal_generated
+        wal_generated=$($PSQL -tAc \
+            "SELECT pg_size_pretty(
+                 pg_wal_lsn_diff(pg_current_wal_lsn(), '${lsn_before}'));" \
+            2>/dev/null || echo "N/A")
+
+        echo ""
+        echo "  VACUUM FREEZE wall time (${MODE}): ${elapsed_ms} ms" \
+            | tee    "$RESULTS_DIR/s15_${MODE}.log"
+        echo "  WAL generated: ${wal_generated}" \
+            | tee -a "$RESULTS_DIR/s15_${MODE}.log"
+        show_repl
+        wait_for_catchup 600
+        echo ""
+    done
+
+    hdr "SCENARIO 15 — RESULTS"
+    echo "  Wall-clock = VACUUM FREEZE execution + commit wait."
+    echo "  remote_apply overhead = time to replay all FREEZE_PAGE + FPI WAL."
+    echo "  No standby queries running — zero conflicts, pure replay throughput."
+    echo ""
+    for MODE in remote_write remote_apply; do
+        local t wal
+        t=$(grep   "VACUUM FREEZE wall time" "$RESULTS_DIR/s15_${MODE}.log" \
+            | awk '{print $(NF-1), $NF}')
+        wal=$(grep "WAL generated"           "$RESULTS_DIR/s15_${MODE}.log" \
+            | awk -F': ' '{print $2}')
+        printf "  %-15s: %-20s  WAL generated: %s\n" "$MODE" "$t" "$wal"
+    done
+    echo ""
+}
+
 # ── MAIN ─────────────────────────────────────────────────────────────────────
 main() {
     local sync_state
@@ -1007,7 +1193,7 @@ main() {
 
     local scenarios=("${@}")
     if [ ${#scenarios[@]} -eq 0 ]; then
-        scenarios=(1 2 3 4 5 6 7 8 9 10 11 12 13)
+        scenarios=(1 2 3 4 5 6 7 8 9 10 11 12 13 14 15)
     fi
 
     for s in "${scenarios[@]}"; do
@@ -1025,6 +1211,8 @@ main() {
             11) scenario11 ;;
             12) scenario12 ;;
             13) scenario13 ;;
+            14) scenario14 ;;
+            15) scenario15 ;;
             *)  warn "Unknown scenario: $s" ;;
         esac
     done
