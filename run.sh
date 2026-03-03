@@ -14,12 +14,21 @@
 
 set -euo pipefail
 
-: "${PRIMARY_HOST:?source syncrep.conf first}"
-: "${STANDBY_HOST:?source syncrep.conf first}"
-: "${PGUSER:?source syncrep.conf first}"
-: "${PGDATABASE:?source syncrep.conf first}"
-: "${SQL_DIR:?source syncrep.conf first}"
-: "${RESULTS_DIR:?source syncrep.conf first}"
+# Auto-source syncrep.conf from the script's own directory when the required
+# env vars are not already in the environment.  This lets you run directly:
+#   bash run.sh          (syncrep.conf must be in the same directory)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -z "${PRIMARY_HOST:-}" && -f "$SCRIPT_DIR/syncrep.conf" ]]; then
+    # shellcheck source=/dev/null
+    source "$SCRIPT_DIR/syncrep.conf"
+fi
+
+: "${PRIMARY_HOST:?syncrep.conf not found or PRIMARY_HOST not set}"
+: "${STANDBY_HOST:?syncrep.conf not found or STANDBY_HOST not set}"
+: "${PGUSER:?syncrep.conf not found or PGUSER not set}"
+: "${PGDATABASE:?syncrep.conf not found or PGDATABASE not set}"
+: "${SQL_DIR:?syncrep.conf not found or SQL_DIR not set}"
+: "${RESULTS_DIR:?syncrep.conf not found or RESULTS_DIR not set}"
 
 export PGPASSWORD="${PGPASSWORD:-}"
 PRIMARY_PORT="${PRIMARY_PORT:-5432}"

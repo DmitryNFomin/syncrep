@@ -3,9 +3,9 @@
 Demonstrates **when and why** `synchronous_commit = remote_apply` adds latency
 compared to `remote_write` on a live PostgreSQL synchronous-replication cluster.
 
-Thirteen scenarios cover every distinct mechanism: snapshot conflicts, lock
-conflicts, buffer-pin stalls, WAL replay throughput, and per-record fsync
-overhead. Each scenario is self-contained and leaves no persistent state.
+Fifteen scenarios cover every distinct mechanism: snapshot conflicts, lock
+conflicts, buffer-pin stalls, WAL replay throughput, per-record fsync overhead,
+and replay saturation at high concurrency. Each scenario is self-contained.
 
 ---
 
@@ -93,31 +93,60 @@ tradeoff including the bloat cost.
 
 ## Prerequisites
 
-- Two PostgreSQL servers (primary + synchronous standby) with Patroni
+- Two PostgreSQL servers (primary + synchronous standby) managed by Patroni
 - `synchronous_mode: true` in Patroni config (or `synchronous_standby_names`
   set manually in `postgresql.conf`)
-- `pgbench` available on the machine running the benchmarks (same major
-  version as the server, or close)
-- Network access to both servers on port 5432
+- `pgbench` on the machine running the benchmarks — same major version as the
+  server, or within one major version. Check with `pgbench --version`.
+- Network access from the benchmark machine to both servers on port 5432
+- The PostgreSQL user set in `syncrep.conf` must be a superuser (needs
+  `ALTER SYSTEM`, `pg_reload_conf()`, `pg_stat_replication`)
 
-### Standby configuration
+### Server settings to verify
 
-Two settings must be tuned before running (on the **standby**):
+**Both nodes — `statement_timeout`**
+
+All scenarios use long-running standby queries (up to 90 s) to hold conflicts.
+If `statement_timeout` is set to a low value (common in production), those
+queries will be cancelled before the conflict materialises and the scenario
+will show no latency difference. Verify:
 
 ```sql
--- Without this, standby cancels conflicting queries immediately,
--- making conflict scenarios (S2, S7, S8, S9, S13) useless.
-ALTER SYSTEM SET max_standby_streaming_delay = '-1';
-
--- Without this, the standby tells the primary which XIDs are still active,
--- causing VACUUM to delay — which suppresses the conflict WAL the
--- snapshot scenarios depend on.
-ALTER SYSTEM SET hot_standby_feedback = off;
-
-SELECT pg_reload_conf();
+SHOW statement_timeout;   -- must be 0 (unlimited) or ≥ 120s
 ```
 
-See "Effect of hot_standby_feedback" at the bottom for the full tradeoff.
+If needed, the scripts override it for standby blocker sessions automatically.
+But if the primary also has a low `statement_timeout`, set it to `0` before
+running.
+
+**Primary — `wal_level` (Scenario 12 only)**
+
+S12 requires `wal_level = logical`. If your cluster already uses logical
+replication this is already set. Otherwise S12 is automatically skipped with a
+warning — no other scenario requires it.
+
+```sql
+SHOW wal_level;   -- 'logical' for S12, 'replica' is fine for S1–S11, S13–S15
+```
+
+### Standby configuration (handled automatically)
+
+`setup_patroni_env.sh` sets these on the standby — you do not need to set them
+manually:
+
+```sql
+-- Wait forever on conflicts instead of cancelling standby queries.
+-- Required for conflict scenarios (S2, S7, S8, S9, S13) to be meaningful.
+ALTER SYSTEM SET max_standby_streaming_delay = '-1';
+
+-- Prevent the standby from suppressing VACUUM on the primary.
+-- Required for snapshot-conflict scenarios (S2, S7, S13) to generate
+-- the conflict WAL that causes replay stalls.
+ALTER SYSTEM SET hot_standby_feedback = off;
+```
+
+See [Effect of `hot_standby_feedback`](#effect-of-hot_standby_feedback) for
+the full tradeoff.
 
 ---
 
@@ -128,19 +157,27 @@ See "Effect of hot_standby_feedback" at the bottom for the full tradeoff.
 git clone <repo>
 cd syncrep
 cp syncrep.conf.example syncrep.conf
-$EDITOR syncrep.conf          # fill in IPs, credentials
+$EDITOR syncrep.conf          # fill in IPs, credentials — everything else is automatic
 
-# 2. Verify cluster connectivity and sync state
-source syncrep.conf && bash setup_patroni_env.sh
+# 2. Verify cluster, create bench DB, configure standby settings
+bash setup_patroni_env.sh
 
-# 3. Run all 13 scenarios
-bash -c "set -a; source syncrep.conf; set +a; bash run.sh"
+# 3. Run all 15 scenarios
+bash run.sh
 
-# 4. Run a subset (e.g. scenarios 1 through 5)
-bash -c "set -a; source syncrep.conf; set +a; bash run.sh 1 5"
+# 4. Run a subset (e.g. scenarios 2, 7, 8 — the dramatic conflict cases)
+bash run.sh 2 7 8
 
 # 5. Print summary report from saved results
-bash -c "set -a; source syncrep.conf; set +a; bash report.sh"
+bash report.sh
+```
+
+Scripts auto-source `syncrep.conf` from their own directory — no need to source
+it manually. If you want to override a variable for a single run without editing
+the file, export it before calling the script:
+
+```bash
+RESULTS_DIR=/my/results bash run.sh
 ```
 
 ### syncrep.conf fields

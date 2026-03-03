@@ -10,6 +10,13 @@
 
 set -euo pipefail
 
+# Auto-source syncrep.conf for RESULTS_DIR if not already set.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -z "${RESULTS_DIR:-}" && -f "$SCRIPT_DIR/syncrep.conf" ]]; then
+    # shellcheck source=/dev/null
+    source "$SCRIPT_DIR/syncrep.conf"
+fi
+
 # ── argument / defaults ───────────────────────────────────────────────────────
 RESULTS_DIR="${1:-${RESULTS_DIR:-/tmp/syncrep_results}}"
 

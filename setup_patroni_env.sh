@@ -19,10 +19,19 @@
 
 set -euo pipefail
 
-: "${PRIMARY_HOST:?source syncrep.conf first (PRIMARY_HOST missing)}"
-: "${STANDBY_HOST:?source syncrep.conf first (STANDBY_HOST missing)}"
-: "${PGUSER:?source syncrep.conf first (PGUSER missing)}"
-: "${PGDATABASE:?source syncrep.conf first (PGDATABASE missing)}"
+# Auto-source syncrep.conf from the script's own directory when the required
+# env vars are not already in the environment.  This lets you run the script
+# directly (bash setup_patroni_env.sh) without sourcing the conf first.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -z "${PRIMARY_HOST:-}" && -f "$SCRIPT_DIR/syncrep.conf" ]]; then
+    # shellcheck source=/dev/null
+    source "$SCRIPT_DIR/syncrep.conf"
+fi
+
+: "${PRIMARY_HOST:?syncrep.conf not found or PRIMARY_HOST not set}"
+: "${STANDBY_HOST:?syncrep.conf not found or STANDBY_HOST not set}"
+: "${PGUSER:?syncrep.conf not found or PGUSER not set}"
+: "${PGDATABASE:?syncrep.conf not found or PGDATABASE not set}"
 
 export PGPASSWORD="${PGPASSWORD:-}"
 PRIMARY_PORT="${PRIMARY_PORT:-5432}"
@@ -138,6 +147,6 @@ ok "hot_standby_feedback        = $feedback"
 echo ""
 echo -e "${BOLD}Setup complete.${NC}  To run benchmarks:"
 echo ""
-echo "  source syncrep.conf && bash run.sh           # all 10 scenarios"
-echo "  source syncrep.conf && bash run.sh 9 10      # specific scenarios"
+echo "  bash run.sh                # all 15 scenarios"
+echo "  bash run.sh 2 7 8         # specific scenarios"
 echo ""
