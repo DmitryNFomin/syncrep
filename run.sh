@@ -408,11 +408,11 @@ scenario3() {
 # ══════════════════════════════════════════════════════════════════════════════
 scenario4() {
     hdr "SCENARIO 4: Schema migration (parallel UPDATE + CREATE INDEX)"
-    echo "  Strategy: 4 concurrent UPDATEs of 500K rows each (touching indexed"
+    echo "  Strategy: 8 concurrent UPDATEs of 250K rows each (touching indexed"
     echo "  columns) + 2 CREATE INDEX — all with synchronous_commit=local."
     echo "  The initial CHECKPOINT causes full-page images (8 KB each) for every"
-    echo "  page modified — creating a massive WAL burst that overwhelms"
-    echo "  single-threaded replay."
+    echo "  page modified.  8 parallel sessions generate WAL faster than"
+    echo "  single-threaded replay can process, building a WAL backlog."
     echo ""
     echo "  After the migration finishes, a synchronous commit measures the"
     echo "  replay catch-up time.  Under remote_write the standby already"
@@ -440,14 +440,14 @@ scenario4() {
         log "Running parallel migration (4× UPDATE + 2× CREATE INDEX, local sync)..."
         local t0=$(date +%s)
 
-        # 4 parallel UPDATEs, each handling 500K rows.
+        # 8 parallel UPDATEs, each handling 250K rows.
         # After CHECKPOINT, the first modification to each page generates
-        # an 8 KB full-page image (FPI).  This creates a massive WAL burst
-        # that overwhelms single-threaded replay — building a WAL backlog.
+        # an 8 KB full-page image (FPI).  8 sessions generate WAL from
+        # 8 CPU cores — faster than single-threaded replay can process.
         local -a UPDATE_PIDS=()
-        for PART in 1 2 3 4; do
-            local start_id=$(( (PART - 1) * 500000 + 1 ))
-            local end_id=$(( PART * 500000 ))
+        for PART in 1 2 3 4 5 6 7 8; do
+            local start_id=$(( (PART - 1) * 250000 + 1 ))
+            local end_id=$(( PART * 250000 ))
             $PSQL -c "SET synchronous_commit TO local" \
                   -c "SET maintenance_work_mem = '256MB'" \
                   -c "UPDATE events SET user_id = user_id + 1, duration_ms = duration_ms + 1, payload = upper(payload) WHERE id BETWEEN $start_id AND $end_id" \
@@ -488,9 +488,9 @@ scenario4() {
         set_sync_mode "local"
         $PSQL -c "DROP INDEX IF EXISTS events_ts_user" \
               -c "DROP INDEX IF EXISTS events_svc_dur" >/dev/null 2>&1
-        for PART in 1 2 3 4; do
-            local start_id=$(( (PART - 1) * 500000 + 1 ))
-            local end_id=$(( PART * 500000 ))
+        for PART in 1 2 3 4 5 6 7 8; do
+            local start_id=$(( (PART - 1) * 250000 + 1 ))
+            local end_id=$(( PART * 250000 ))
             $PSQL -c "UPDATE events SET user_id = user_id - 1, duration_ms = duration_ms - 1, payload = lower(payload) WHERE id BETWEEN $start_id AND $end_id" \
                   >/dev/null 2>&1 &
         done
