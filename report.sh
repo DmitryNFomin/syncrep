@@ -76,8 +76,8 @@ parse_wall_time() {
 parse_blocking_stats() {
     local file="$1"
     local zero total
-    zero=$(grep -c ', 0\.0 tps,' "$file" 2>/dev/null || echo 0)
-    total=$(grep -c '^progress:' "$file" 2>/dev/null || echo 0)
+    zero=$(grep -c ', 0\.0 tps,' "$file" 2>/dev/null) || zero=0
+    total=$(grep -c '^progress:' "$file" 2>/dev/null) || total=0
     echo "$zero $total"
 }
 
@@ -472,7 +472,7 @@ main() {
         # Skip blocking scenarios — their avg latency is meaningless
         local chk_file="${RESULTS_DIR}/s${pb_ids[$idx]}_remote_apply.log"
         local chk_zero
-        chk_zero=$(grep -c ', 0\.0 tps,' "$chk_file" 2>/dev/null || echo 0)
+        chk_zero=$(grep -c ', 0\.0 tps,' "$chk_file" 2>/dev/null) || chk_zero=0
         [ "$chk_zero" -gt 0 ] && continue
         sum_vals+=("${pb_added[$idx]}")
         sum_ids+=("${pb_ids[$idx]}")

@@ -105,8 +105,8 @@ extract_tps() {
 parse_blocking_stats() {
     local file="$1"
     local zero total
-    zero=$(grep -c ', 0\.0 tps,' "$file" 2>/dev/null || echo 0)
-    total=$(grep -c '^progress:' "$file" 2>/dev/null || echo 0)
+    zero=$(grep -c ', 0\.0 tps,' "$file" 2>/dev/null) || zero=0
+    total=$(grep -c '^progress:' "$file" 2>/dev/null) || total=0
     echo "$zero $total"
 }
 
@@ -729,7 +729,7 @@ scenario9() {
         # (already-frozen tuples are skipped; we need unfrozen ones).
         log "Updating 1/3 of rows to create unfrozen tuples (local sync)..."
         $PSQL -c "SET synchronous_commit TO local;
-                  UPDATE freeze_test SET b = repeat(chr(65 + (id % 26)), 500)
+                  UPDATE freeze_test SET b = repeat(chr(65 + (id % 26)::int), 500)
                   WHERE id % 3 = 0;" >/dev/null
 
         # Start 80 parallel full-table scans on standby to build buffer pin pressure.
@@ -751,7 +751,7 @@ scenario9() {
         (
             for i in $(seq 1 12); do
                 $PSQL -c "SET synchronous_commit TO local;
-                          UPDATE freeze_test SET b = repeat(chr(65 + (id % 26)), 500)
+                          UPDATE freeze_test SET b = repeat(chr(65 + (id % 26)::int), 500)
                           WHERE id % 5 = 0;" \
                       >/dev/null 2>&1
                 $PSQL -c "SET vacuum_freeze_min_age = 0;
