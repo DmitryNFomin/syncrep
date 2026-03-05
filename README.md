@@ -109,7 +109,7 @@ scenarios demonstrate.
 | S12 Logical rewrite | pg_fsync per rewrite record | +336 ms (300K rows); scales with rows × fsync latency | **No** |
 | S11 DROP partitions | unlink() per file on replay | scales with N parts | **No** |
 | S14 Replay saturation | WAL gen > single-thread replay | grows with concurrency | **No** |
-| S4 CREATE INDEX | Index build on replay | ~17 ms | **No** |
+| S4 Schema migration | WAL backlog from parallel DDL | +2–5 s (wall clock) | **No** |
 | S1 Index-heavy scattered | ~800 page mods per commit | +10–15 ms | — |
 | S3 GIN/TOAST batch | CPU-bound GIN replay | +10–15 ms | — |
 
@@ -381,25 +381,34 @@ bash run.sh 4   # ~10 min
 
 **Setup**: `events` table (2 M rows) with 4 secondary B-tree indexes on
 `(user_id, ts)`, `(duration_ms)`, `(service, ts)`, `(user_id, duration_ms)`.
-A probe table (`probe_s4`) takes the latency measurement.
+A probe table (`probe_s4`) measures the first synchronous commit after the
+migration finishes.
 
-**What it does**: While a pgbench probe runs (16 clients, 90 s), 4 parallel
-UPDATE sessions each handle 500 K rows (touching indexed columns `user_id`
-and `duration_ms`), then 2 indexes are created. The UPDATEs force non-HOT
-updates (changing indexed columns = all-or-nothing), so every row generates
-~6 WAL records (heap + 5 index updates).
+**What it does**: 4 parallel UPDATE sessions each handle 500 K rows (touching
+indexed columns `user_id` and `duration_ms`), then 2 indexes are created —
+all with `synchronous_commit = local`. After the migration finishes, a single
+synchronous `INSERT` into the probe table measures how long the standby takes
+to catch up with the WAL backlog.
 
 **Why latency increases**: 4 concurrent UPDATE sessions generate WAL
 simultaneously from 4 CPU cores, but replay is single-threaded. Combined WAL
 rate from 4 sessions exceeds single-threaded replay throughput → a WAL backlog
-builds. Probe commits under `remote_apply` must wait behind this growing
-backlog. A single UPDATE session doesn't saturate replay on fast hardware;
-parallelism is the key.
+builds during the migration. After the migration finishes, the standby has
+already received the WAL (write_lsn is current) but has not finished replaying
+it (replay_lsn is behind). Under `remote_write` the first commit returns
+instantly (~RTT). Under `remote_apply` it must wait for the entire WAL
+backlog to be replayed — seconds of stall.
 
-**What to look for**: Sustained latency elevation during the parallel UPDATE
-phase (visible in progress lines), then a second bump during index creation.
+**What to look for**:
+```
+  remote_write:      3 ms    (standby already received WAL)
+  remote_apply:   4200 ms    (waited for WAL backlog replay)
+```
+The `pg_stat_replication` output shown right before the probe commit reveals
+the replay backlog: `replay_lag` will be in seconds while `write_lag` is
+milliseconds.
 
-**Typical result**: +10–30 ms during migration
+**Typical result**: +2–5 s; scales with migration WAL volume
 
 ---
 
@@ -769,7 +778,7 @@ are unaffected regardless of this setting.
      8  Table rewrite / lock conflict           BLOCKED ← 0 TPS for 60/70s (170x TPS drop)
      1  Index-heavy scattered UPDATE (100 rows)  110.2     149.6    +39.4
      3  GIN + TOAST batch (30 rows scattered)   108.4     119.7    +11.3
-     4  Schema migration (time-weighted)          1.0     148.1   +147.1
+     4  Schema migration (wall clock)                3      4200    +4197
     12  VACUUM FULL + logical slot              2197      2533     +336
 ```
 

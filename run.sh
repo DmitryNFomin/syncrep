@@ -411,9 +411,13 @@ scenario4() {
     echo "  Strategy: 4 concurrent UPDATEs of 500K rows each (touching indexed"
     echo "  columns) + 2 CREATE INDEX — all with synchronous_commit=local."
     echo "  The initial CHECKPOINT causes full-page images (8 KB each) for every"
-    echo "  page modified — creating a brief but massive WAL burst (~500 MB in"
-    echo "  ~10s) that overwhelms single-threaded replay."
-    echo "  A short 25s probe captures this burst with minimal dilution."
+    echo "  page modified — creating a massive WAL burst that overwhelms"
+    echo "  single-threaded replay."
+    echo ""
+    echo "  After the migration finishes, a synchronous commit measures the"
+    echo "  replay catch-up time.  Under remote_write the standby already"
+    echo "  received the WAL — returns in ~RTT.  Under remote_apply the commit"
+    echo "  waits for the entire WAL backlog to be replayed."
     echo ""
 
     set_sync_mode "local"
@@ -439,7 +443,7 @@ scenario4() {
         # 4 parallel UPDATEs, each handling 500K rows.
         # After CHECKPOINT, the first modification to each page generates
         # an 8 KB full-page image (FPI).  This creates a massive WAL burst
-        # in the first ~10-15s that overwhelms single-threaded replay.
+        # that overwhelms single-threaded replay — building a WAL backlog.
         local -a UPDATE_PIDS=()
         for PART in 1 2 3 4; do
             local start_id=$(( (PART - 1) * 500000 + 1 ))
@@ -450,16 +454,6 @@ scenario4() {
                   >/dev/null 2>&1 &
             UPDATE_PIDS+=($!)
         done
-
-        # Start probe SIMULTANEOUSLY with migration — 25s captures
-        # the FPI burst with minimal dilution from post-burst calm.
-        sleep 2  # let UPDATEs ramp up WAL generation
-        log "Starting probe pgbench (16 clients, 25s)..."
-        $PGBENCH \
-            -f $SQL_DIR/scenario4_create_index/workload_probe.sql \
-            -c 16 -j 8 -T 25 -P 5 --progress-timestamp 2>&1 \
-            | tee "$RESULTS_DIR/s4_${MODE}.log" &
-        PGBENCH_PID=$!
 
         for pid in "${UPDATE_PIDS[@]}"; do wait "$pid" 2>/dev/null || true; done
         log "  parallel UPDATE done ($(( $(date +%s) - t0 ))s elapsed)"
@@ -472,10 +466,22 @@ scenario4() {
               -c "CREATE INDEX events_svc_dur ON events(service, duration_ms)" 2>&1
         log "  btree index #2 done ($(( $(date +%s) - t0 ))s elapsed)"
 
-        log "Migration done. Waiting for pgbench to finish..."
-        wait $PGBENCH_PID || true
-
+        log "Migration done. Measuring replay catch-up time..."
         show_repl
+
+        # Measure: how long does the first synchronous commit take?
+        # Under remote_write: standby already received all WAL → ~RTT.
+        # Under remote_apply: must wait for entire WAL backlog to replay.
+        local t0_ms
+        t0_ms=$(date +%s%3N)
+        $PSQL -c "INSERT INTO probe_s4 (val) VALUES (1)"
+        local elapsed_ms=$(( $(date +%s%3N) - t0_ms ))
+
+        echo ""
+        echo "  First sync commit after migration (${MODE}): ${elapsed_ms} ms" \
+            | tee "$RESULTS_DIR/s4_${MODE}.log"
+        show_repl
+        wait_for_catchup 300
         echo ""
 
         # Reverse changes for next iteration
@@ -493,8 +499,17 @@ scenario4() {
         wait_for_catchup 300
     done
 
-    print_burst_comparison "SCENARIO 4" "$RESULTS_DIR/s4_remote_write.log" \
-                          "$RESULTS_DIR/s4_remote_apply.log"
+    hdr "SCENARIO 4 — RESULTS"
+    echo "  Wall-clock time for first synchronous commit after migration."
+    echo "  remote_write: standby already received WAL — returns in ~RTT."
+    echo "  remote_apply: must wait for entire WAL backlog to be replayed."
+    echo ""
+    for MODE in remote_write remote_apply; do
+        local t
+        t=$(grep "First sync commit" "$RESULTS_DIR/s4_${MODE}.log" | awk '{print $(NF-1), $NF}')
+        printf "  %-15s: %s\n" "$MODE" "$t"
+    done
+    echo ""
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1384,6 +1399,21 @@ main() {
         local ra_f="$RESULTS_DIR/s${S_NUM}_remote_apply.log"
         if [ -f "$rw_f" ] && [ -f "$ra_f" ]; then
 
+            # S4: wall-clock first sync commit after migration
+            if [ "$S_NUM" = "4" ]; then
+                local t_rw t_ra
+                t_rw=$(grep 'First sync commit' "$rw_f" | awk '{print $(NF-1)}')
+                t_ra=$(grep 'First sync commit' "$ra_f" | awk '{print $(NF-1)}')
+                if [ -n "$t_rw" ] && [ -n "$t_ra" ]; then
+                    local added ratio
+                    added=$(awk "BEGIN {printf \"%.1f\", $t_ra - $t_rw}")
+                    ratio=$(awk "BEGIN {printf \"%.1f\", $t_ra / $t_rw}")
+                    printf "  S%-3d %14s %14s %+13.1f %7sx\n" \
+                        "$S_NUM" "$t_rw" "$t_ra" "$added" "$ratio"
+                fi
+                continue
+            fi
+
             # S12: wall-clock VACUUM FULL time (not pgbench)
             if [ "$S_NUM" = "12" ]; then
                 local t_rw t_ra
@@ -1415,14 +1445,8 @@ main() {
                     "$S_NUM" "${lat_rw:-?}" "$blocked_s" "$total_s" "$tps_ratio"
             else
                 local lat_rw lat_ra added ratio
-                # S4 uses time-weighted avg (burst scenario)
-                if [ "$S_NUM" = "4" ]; then
-                    lat_rw=$(extract_time_weighted_latency "$rw_f")
-                    lat_ra=$(extract_time_weighted_latency "$ra_f")
-                else
-                    lat_rw=$(extract_avg_latency "$rw_f")
-                    lat_ra=$(extract_avg_latency "$ra_f")
-                fi
+                lat_rw=$(extract_avg_latency "$rw_f")
+                lat_ra=$(extract_avg_latency "$ra_f")
                 if [ -n "$lat_rw" ] && [ -n "$lat_ra" ]; then
                     added=$(awk "BEGIN {printf \"%.1f\", $lat_ra - $lat_rw}")
                     ratio=$(awk "BEGIN {printf \"%.1f\", $lat_ra / $lat_rw}")

@@ -43,7 +43,7 @@ scenario_name() {
         1)   echo "Index-heavy scattered UPDATE (100 rows)" ;;
         2)   echo "Blocked replay (snapshot conflict)" ;;
         3)   echo "GIN + TOAST batch (30 rows scattered)" ;;
-        4)   echo "Schema migration (time-weighted)" ;;
+        4)   echo "Schema migration (wall clock)" ;;
         5)   echo "Bulk INSERT / ETL" ;;
         6)   echo "FPI storm (HW-scale dependent)" ;;
         7)   echo "Reporting query (cross-table blast)" ;;
@@ -161,7 +161,7 @@ main() {
 
     local -a missing_list=()  # human-readable list of unavailable scenario IDs
 
-    for N in 1 2 3 4 7 8 14; do
+    for N in 1 2 3 7 8 14; do
         local rw_f="${RESULTS_DIR}/s${N}_remote_write.log"
         local ra_f="${RESULTS_DIR}/s${N}_remote_apply.log"
         local name
@@ -173,15 +173,8 @@ main() {
         fi
 
         local rw ra
-        if [ "$N" = "4" ]; then
-            # S4 is a burst scenario: use time-weighted average to avoid
-            # dilution from the calm period after the FPI burst.
-            rw=$(parse_time_weighted_latency "$rw_f")
-            ra=$(parse_time_weighted_latency "$ra_f")
-        else
-            rw=$(parse_pgbench_latency "$rw_f")
-            ra=$(parse_pgbench_latency "$ra_f")
-        fi
+        rw=$(parse_pgbench_latency "$rw_f")
+        ra=$(parse_pgbench_latency "$ra_f")
 
         if [ -z "$rw" ] || [ -z "$ra" ]; then
             # Files exist but could not be parsed — treat as parse error
@@ -314,13 +307,42 @@ main() {
     printf "\n"
 
     # ──────────────────────────────────────────────────────────────────────────
-    # Wallclock section: S10a (pgbench), S10b (wall), S11 (wall), S12 (wall)
+    # Wallclock section: S4 (wall), S10a (pgbench), S10b (wall), S11 (wall), S12 (wall)
     # ──────────────────────────────────────────────────────────────────────────
     printf "${C_YELLOW}  ── single-operation wall time (total time for the operation itself) ────────${C_RESET}\n"
     printf "\n"
     printf "   %-4s %-36s  %7s  %8s  %8s\n" \
         "#" "Scenario" "rw_ms" "ra_ms" "added_ms"
     printf "  ${C_BOLD}%s${C_RESET}\n" "$THIN_DIV"
+
+    # S4 — first sync commit after migration (wall clock)
+    local s4_rw_f="${RESULTS_DIR}/s4_remote_write.log"
+    local s4_ra_f="${RESULTS_DIR}/s4_remote_apply.log"
+    if [ -f "$s4_rw_f" ] && [ -f "$s4_ra_f" ]; then
+        local s4_rw s4_ra
+        s4_rw=$(parse_wall_time "$s4_rw_f" "First sync commit")
+        s4_ra=$(parse_wall_time "$s4_ra_f" "First sync commit")
+        if [ -n "$s4_rw" ] && [ -n "$s4_ra" ]; then
+            local s4_added
+            s4_added=$(awk_sub "$s4_ra" "$s4_rw")
+            local s4_added_fmt
+            local s4_neg
+            s4_neg=$(awk "BEGIN { print ($s4_added < 0) ? 1 : 0 }")
+            if [ "$s4_neg" = "1" ]; then
+                s4_added_fmt="$s4_added"
+            else
+                s4_added_fmt="+${s4_added}"
+            fi
+            printf "  %4s  %-36s  %7s  %8s  %8s\n" \
+                "4" "$(scenario_name 4)" \
+                "$s4_rw" "$s4_ra" "$s4_added_fmt"
+        else
+            printf "  ${C_RED}%4s  %-36s  %7s  %8s  %8s${C_RESET}\n" \
+                "4" "$(scenario_name 4)" "ERR" "ERR" "parse error"
+        fi
+    else
+        missing_list+=("S4")
+    fi
 
     # S10a — pgbench part of scenario 10
     local s10_rw_f="${RESULTS_DIR}/s10_remote_write.log"
