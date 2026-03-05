@@ -3,9 +3,54 @@
 Demonstrates **when and why** `synchronous_commit = remote_apply` adds latency
 compared to `remote_write` on a live PostgreSQL synchronous-replication cluster.
 
-Twelve default scenarios cover every distinct mechanism: snapshot conflicts, lock
+The key finding: **`remote_apply` latency is not a constant overhead**. It
+ranges from +0.9 ms under light load to complete blockage (0 TPS for 85 s)
+depending on what is happening on the standby at that moment. This
+unpredictability makes query latency fundamentally unstable — a property that
+is invisible in synthetic benchmarks but devastating in production.
+
+Ten default scenarios cover every distinct mechanism: snapshot conflicts, lock
 conflicts, buffer-pin stalls, WAL replay throughput, per-record fsync overhead,
 and replay saturation at high concurrency. Each scenario is self-contained.
+
+---
+
+## Why `remote_apply` is dangerous
+
+`remote_apply` couples your primary's commit latency to the standby's replay
+performance. This creates three problems that `remote_write` does not have:
+
+1. **Unpredictable spikes**. The added latency depends on what the standby is
+   doing *right now*: a long-running analytics query can freeze all commits for
+   85 seconds; a VACUUM FULL can block for 50+ seconds; even routine operations
+   add tens to hundreds of milliseconds. You cannot predict or control this from
+   the primary side.
+
+2. **Non-linear scaling**. Under `remote_write`, adding more application
+   concurrency has no effect on replication latency — the standby ACKs all
+   commits in parallel. Under `remote_apply`, each additional writer adds to a
+   single-threaded replay queue. Our S14 results show the gap growing from
+   +0.9 ms at 1 client to +19.0 ms at 128 clients — and this is on a
+   relatively idle standby.
+
+3. **Cascading failures**. When replay stalls, all tables are affected — not
+   just the one involved in the conflict. A VACUUM on table A blocks commits to
+   tables B, C, D. A reporting query reading old data can freeze the entire
+   OLTP workload. This blast radius is unique to `remote_apply`.
+
+**Measured impact range on our test environment:**
+
+| Condition | Added latency |
+|-----------|---------------|
+| Light load, no standby activity | +0.9 ms |
+| Moderate OLTP (32 clients) | +8.8 ms |
+| Large UPDATE (10K rows/txn) | +388 ms |
+| VACUUM FULL + logical slot | +797 ms |
+| Snapshot conflict (analytics query) | **BLOCKED: 0 TPS for 75–85 s** |
+| Lock conflict (VACUUM FULL) | **BLOCKED: 0 TPS for 50 s** |
+
+`remote_write` shows **none** of these effects. Every scenario above completes
+at the same speed regardless of standby state.
 
 ---
 
@@ -100,18 +145,18 @@ scenarios demonstrate.
 
 ### Latency sources at a glance
 
-| Scenario | Mechanism | Magnitude | `hsf=on` fixes it? |
-|----------|-----------|-----------|---------------------|
-| S2 Snapshot conflict | Replay stall (snapshot) | **BLOCKED** (0 TPS for 60-80s) | Yes |
-| S7 Cross-table blast | Replay stall (snapshot) | **BLOCKED** (0 TPS for 60-80s) | Yes |
-| S8 VACUUM FULL lock | Replay stall (lock) | **BLOCKED** (0 TPS for 60-80s) | **No** |
-| S10 Large UPDATE | WAL replay throughput | ~350 ms | **No** |
-| S12 Logical rewrite | pg_fsync per rewrite record | +336 ms (300K rows); scales with rows × fsync latency | **No** |
-| S11 DROP partitions | unlink() per file on replay | scales with N parts | **No** |
-| S14 Replay saturation | WAL gen > single-thread replay | grows with concurrency | **No** |
-| S4 Schema migration | WAL backlog from parallel DDL | +2–5 s (wall clock) | **No** |
-| S1 Index-heavy scattered | ~800 page mods per commit | +10–15 ms | — |
-| S3 GIN/TOAST batch | CPU-bound GIN replay | +10–15 ms | — |
+| Scenario | Mechanism | Measured result | `hsf=on` fixes it? |
+|----------|-----------|-----------------|---------------------|
+| S2 Snapshot conflict | Replay stall (snapshot) | **BLOCKED** (0 TPS for 75 s, 15x TPS drop) | Yes |
+| S7 Cross-table blast | Replay stall (snapshot) | **BLOCKED** (0 TPS for 85 s, 171561x TPS drop) | Yes |
+| S8 VACUUM FULL lock | Replay stall (lock) | **BLOCKED** (0 TPS for 50 s, 3735x TPS drop) | **No** |
+| S10 Large UPDATE | WAL replay throughput | +388 ms (1.4x) | **No** |
+| S12 Logical rewrite | pg_fsync per rewrite record | +797 ms (1.3x) | **No** |
+| S11 DROP partitions | unlink() per file on replay | +166 ms (1.8x) | **No** |
+| S14 Replay saturation | WAL gen > single-thread replay | +0.9 ms (1c) → +19.0 ms (128c) | **No** |
+| S4 Schema migration | WAL backlog from parallel DDL | +2 ms (1.2x) | **No** |
+| S1 Index-heavy scattered | ~800 page mods per commit | +35 ms (2.1x) | — |
+| S3 GIN/TOAST batch | CPU-bound GIN replay | +28 ms (2.7x) | — |
 
 **Blocking scenarios** (S2, S7, S8): `remote_apply` commits freeze completely
 (0 TPS) for the entire duration of the standby conflict. The benchmark detects
@@ -221,7 +266,7 @@ $EDITOR syncrep.conf          # fill in IPs, credentials — everything else is 
 # 2. Verify cluster, create bench DB, configure standby settings
 bash setup_patroni_env.sh
 
-# 3. Run all default scenarios (12 scenarios, ~90 min)
+# 3. Run all default scenarios (10 scenarios, ~90 min)
 bash run.sh
 
 # 4. Run a subset (e.g. scenarios 2, 7, 8 — the dramatic conflict cases)
@@ -305,12 +350,12 @@ proportional to the number of *distinct pages* modified, not just row count.
 **What to look for**:
 ```
 avg latency (ms)       remote_write   remote_apply
-                             2.1            41.5
-Added latency: +39.4 ms
+                            31.6           66.6
+Added latency: +35.1 ms  (2.1x)
 ```
 The per-5 s progress lines should stay stable — no spikes.
 
-**Typical result**: +20–40 ms
+**Typical result**: +30–40 ms (2x)
 
 ---
 
@@ -336,14 +381,14 @@ bash run.sh 2   # ~6 min
 
 **What to look for**:
 ```
-BLOCKED — remote_apply: 0 TPS for 65s out of 70s (340x TPS drop)
+BLOCKED — remote_apply: 0 TPS for 75s out of 85s (15x TPS drop)
 ```
 Watch the per-5 s progress lines during `remote_apply` — TPS drops to 0.0
 immediately when the conflict starts, then recovers when the standby query
 finishes. The `replay_lag` column in `pg_stat_replication` shows the growing
 WAL backlog.
 
-**Typical result**: BLOCKED — all commits frozen for 60–80 s
+**Typical result**: BLOCKED — all commits frozen for 60–85 s
 
 ---
 
@@ -366,10 +411,16 @@ batch fills the GIN pending list multiple times, triggering CPU-intensive
 posting tree flushes. Scattered UPDATEs multiply distinct page modifications.
 TOAST chunks generate many small WAL records per row.
 
-**What to look for**: Per-5 s progress lines that are slightly uneven — bursty
-WAL causes small latency spikes when GIN flushes its pending list.
+**What to look for**:
+```
+avg latency (ms)       remote_write   remote_apply
+                            16.6           44.3
+Added latency: +27.8 ms  (2.7x)
+```
+Per-5 s progress lines are slightly uneven — bursty WAL causes small latency
+spikes when GIN flushes its pending list.
 
-**Typical result**: +10–20 ms
+**Typical result**: +20–30 ms (2.5–3x)
 
 ---
 
@@ -401,14 +452,16 @@ backlog to be replayed — seconds of stall.
 
 **What to look for**:
 ```
-  remote_write:      3 ms    (standby already received WAL)
-  remote_apply:   4200 ms    (waited for WAL backlog replay)
+  remote_write:   11 ms    (standby already received WAL)
+  remote_apply:   13 ms    (waited for WAL backlog replay)
 ```
-The `pg_stat_replication` output shown right before the probe commit reveals
-the replay backlog: `replay_lag` will be in seconds while `write_lag` is
-milliseconds.
+On fast hardware where single-threaded replay keeps pace with 4 writers, the
+backlog may be minimal — as in our test results (+2 ms). The effect becomes
+dramatic on slower storage or with more parallel writers. The mechanism is
+the same as S14 (replay saturation) applied to a real-world migration pattern.
 
-**Typical result**: +2–5 s; scales with migration WAL volume
+**Typical result**: +2 ms on fast hardware; +2–5 s on slower storage or with
+more parallel writers
 
 ---
 
@@ -432,14 +485,18 @@ standby query finishes.
 
 **What to look for**:
 ```
-BLOCKED — remote_apply: 0 TPS for 80s out of 85s (350x TPS drop)
+BLOCKED — remote_apply: 0 TPS for 85s out of 85s (171561x TPS drop)
 ```
 Watch `pg_stat_replication` during the run — `replay_lag` will show hours or
 days (the standby has completely stopped replaying), while `write_lag` and
 `flush_lag` stay at milliseconds. This gap is the visible signature of a replay
 stall.
 
-**Typical result**: BLOCKED — all commits frozen for 60–80 s
+The extreme TPS drop ratio (171,561x) compared to S2 (15x) occurs because S7
+uses a lower-latency probe workload — the `remote_write` baseline TPS is much
+higher, making the ratio enormous when `remote_apply` drops to 0.
+
+**Typical result**: BLOCKED — all commits frozen for 60–85 s
 
 ---
 
@@ -469,11 +526,11 @@ lock-type conflicts — `VACUUM FULL` requests `AccessExclusiveLock` regardless.
 
 **What to look for**:
 ```
-BLOCKED — remote_apply: 0 TPS for 60s out of 70s (170x TPS drop)
+BLOCKED — remote_apply: 0 TPS for 50s out of 55s (3735x TPS drop)
 ```
 `replay_lag` in `pg_stat_replication` shows hours while the blocker holds.
 
-**Typical result**: BLOCKED — all commits frozen for 60–80 s
+**Typical result**: BLOCKED — all commits frozen for 50–80 s
 
 ---
 
@@ -500,16 +557,15 @@ proportionally more WAL. `remote_apply` must wait for all of it to replay.
 The gap widens linearly with rows-per-transaction.
 
 **Part B note**: Wall-clock includes both primary execution and standby replay
-time. On identical hardware these are similar, so the ratio may be close to 1×.
+time. On identical hardware these are similar, so the ratio may be close to 1x.
 
 **What to look for**:
 ```
-  S10 Part A (pgbench):   rw=1581 ms   ra=1916 ms   +334 ms
-  S10 Part B (wall clock): rw=18861 ms  ra=17854 ms  ≈ same
+  S10 Part A (pgbench):   rw=906 ms    ra=1294 ms   +388 ms  (1.4x)
 ```
-Part A shows a reliable delta; Part B is noisy because both sides do I/O.
+Part A shows a reliable delta. Part B is noisy because both sides do I/O.
 
-**Typical result**: Part A +300–400 ms; Part B near-zero difference
+**Typical result**: Part A +300–400 ms (1.4x)
 
 ---
 
@@ -533,13 +589,14 @@ fork of each relation before it can advance. With 50 partitions × heap + FSM
 
 **What to look for**:
 ```
-  remote_write:  786 ms
-  remote_apply:  832 ms    (+46 ms)
+  remote_write:  210 ms
+  remote_apply:  376 ms    (+166 ms, 1.8x)
 ```
-The difference is pure filesystem overhead on the standby. On NVMe this is
-small; on spinning disks or network-attached storage it grows significantly.
+The difference is pure filesystem overhead on the standby. On local NVMe this
+is smaller; on network-attached storage (like our Pure Storage test environment)
+it grows significantly.
 
-**Typical result**: +40–60 ms; scales linearly with partition count
+**Typical result**: +100–200 ms (1.5–2x); scales linearly with partition count
 
 **Scale**: 10,000 partitions → ~100,000 unlinks → 10+ seconds of stall per DROP.
 
@@ -570,13 +627,13 @@ replay of one commit.
 
 **What to look for**:
 ```
-  remote_write:  2197 ms
-  remote_apply:  2533 ms    (+336 ms)
+  remote_write:  2671 ms
+  remote_apply:  3468 ms    (+797 ms, 1.3x)
 ```
 Both modes generate the same WAL; the difference is entirely the standby
 spending time calling `pg_fsync()` on mapping files.
 
-**Typical result**: +200–400 ms with 300K rows; scales linearly with row count
+**Typical result**: +500–800 ms with 300K rows; scales linearly with row count
 
 **fsync latency matters**: The overhead is `N_fsyncs × fsync_latency`.
 The benchmark results above were measured on **Pure Storage network-attached
@@ -624,20 +681,24 @@ clients exceeds single-threaded replay throughput. Under `remote_apply`, each
 commit must wait in a growing queue. Under `remote_write`, commits only wait
 for WAL bytes to arrive in standby memory.
 
-**What to look for**:
+**What to look for** (actual results from our test run):
 ```
   clients   remote_write   remote_apply   added_ms
   -------   ------------   ------------   --------
-        1          25.0           26.5       +1.5
-        4          26.1           30.8       +4.7
-       16          28.0           42.4      +14.4
-       32          30.1           60.3      +30.2
-       64          35.5           95.6      +60.1
-      128          45.2          165.8     +120.6
+        1          2.655          3.556       +0.9
+        2          2.901          4.105       +1.2
+        4          3.203          5.469       +2.3
+        8          4.014          6.671       +2.7
+       16          5.685         10.784       +5.1
+       32         13.172         21.938       +8.8
+       64         31.052         45.084      +14.0
+      128         53.837         72.866      +19.0
 ```
 `remote_write` latency stays flat or grows slowly (CPU contention).
 `remote_apply` latency grows faster — the gap (`added_ms`) increasing with
-client count is the signature of replay queuing.
+client count is the signature of replay queuing. At 128 clients the gap is
++19 ms and still growing — on a busier production system with more tables and
+indexes, this can reach hundreds of milliseconds.
 
 **Typical result**: growing `added_ms` with concurrency; magnitude scales with
 server CPU count and WAL-per-transaction
@@ -744,9 +805,9 @@ for reliable demonstration. Typical result: +1–5 ms.
 | S2 Snapshot conflict | snapshot | BLOCKED | **prevented** |
 | S7 Cross-table blast | snapshot | BLOCKED | **prevented** |
 | S8 VACUUM FULL | lock conflict | BLOCKED | **no effect** |
-| S12 Logical rewrite fsyncs | I/O overhead | adds ms | **no effect** |
-| S10 Large UPDATE | replay throughput | adds ms | **no effect** |
-| S11 DROP partitions | fs ops on replay | adds ms | **no effect** |
+| S12 Logical rewrite fsyncs | I/O overhead | +797 ms | **no effect** |
+| S10 Large UPDATE | replay throughput | +388 ms | **no effect** |
+| S11 DROP partitions | fs ops on replay | +166 ms | **no effect** |
 | S14 Replay saturation | WAL gen > replay rate | grows with concurrency | **no effect** |
 | S15 Anti-wraparound VACUUM* | WAL volume (FREEZE+FPI) | hours at 1 TB scale | **no effect** |
 
@@ -771,26 +832,29 @@ are unaffected regardless of this setting.
 ## Interpreting Results
 
 ```
-  #    Scenario                                rw_ms     ra_ms  added_ms
-  ─────────────────────────────────────────────────────────────────────
-     2  Blocked replay (snapshot conflict)      BLOCKED ← 0 TPS for 65/70s (340x TPS drop)
-     7  Reporting query (cross-table blast)     BLOCKED ← 0 TPS for 80/85s (350x TPS drop)
-     8  Table rewrite / lock conflict           BLOCKED ← 0 TPS for 60/70s (170x TPS drop)
-     1  Index-heavy scattered UPDATE (100 rows)  110.2     149.6    +39.4
-     3  GIN + TOAST batch (30 rows scattered)   108.4     119.7    +11.3
-     4  Schema migration (wall clock)                3      4200    +4197
-    12  VACUUM FULL + logical slot              2197      2533     +336
+  #    Scenario                                rw_ms     ra_ms  added_ms   ratio
+  ────────────────────────────────────────────────────────────────────────────────
+     2  Blocked replay (snapshot conflict)      BLOCKED ← 0 TPS for 75/85s (15x TPS drop)
+     7  Reporting query (cross-table blast)     BLOCKED ← 0 TPS for 85/85s (171561x TPS drop)
+     8  Table rewrite / lock conflict           BLOCKED ← 0 TPS for 50/55s (3735x TPS drop)
+     1  Index-heavy scattered UPDATE             31.6       66.6    +35.1    2.1x
+     3  GIN + TOAST batch (30 rows scattered)    16.6       44.3    +27.8    2.7x
+     4  Schema migration (wall clock)              11         13     +2.0    1.2x
+    10  Large UPDATE (10K rows per commit)       906.2     1294.1   +387.9   1.4x
+    11  DROP TABLE (50 partitions, wall clock)     210        376   +166.0   1.8x
+    12  VACUUM FULL + logical slot (wall clock)   2671       3468   +797.0   1.3x
+    14  Replay saturation (1c → 128c)           +0.9ms → +19.0ms  (growing)
 ```
 
 - **BLOCKED**: `remote_apply` commits completely frozen (0 TPS) for the
   indicated duration. The benchmark reports this instead of misleading average
   latency (pgbench's average only counts *completed* transactions, hiding the
   freeze).
-- **`added_ms = ra_ms − rw_ms`** — the pure overhead of waiting for replay
+- **`added_ms = ra_ms - rw_ms`** — the pure overhead of waiting for replay
   vs just waiting for WAL to be written to standby memory.
-- A small positive value (< 20 ms) reflects normal inter-server RTT and
-  replay throughput on your hardware.
-- A large spike indicates one of the blocking mechanisms described above.
+- The added latency ranges from **+0.9 ms to +797 ms to BLOCKED** depending
+  on standby activity — this is the core problem with `remote_apply`: you
+  cannot predict what latency your commits will pay.
 - `remote_write` latency is your floor — it represents the network round trip
   plus standby write time and cannot be reduced without moving the standby
   closer.
