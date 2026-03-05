@@ -40,9 +40,9 @@ fi
 # ── scenario metadata ─────────────────────────────────────────────────────────
 scenario_name() {
     case "$1" in
-        1)   echo "Index-heavy scattered UPDATE (50 rows)" ;;
+        1)   echo "Index-heavy scattered UPDATE (100 rows)" ;;
         2)   echo "Blocked replay (snapshot conflict)" ;;
-        3)   echo "GIN + TOAST batch (8 rows)" ;;
+        3)   echo "GIN + TOAST batch (30 rows scattered)" ;;
         4)   echo "Schema migration (CREATE INDEX)" ;;
         5)   echo "Bulk INSERT / ETL" ;;
         6)   echo "FPI storm (HW-scale dependent)" ;;
@@ -54,8 +54,8 @@ scenario_name() {
         11)  echo "DROP 50-partition table (wall clock)" ;;
         12)  echo "VACUUM FULL + logical slot (wall clock)" ;;
         13)  echo "Hash VACUUM (snapshot + cleanup lock)" ;;
-        14)  echo "Replay saturation (5-row × 4 idx)" ;;
-        15)  echo "Anti-wraparound VACUUM FREEZE (wall clock)" ;;
+        14)  echo "Replay saturation (50-row scattered × 11 idx)" ;;
+        15)  echo "Anti-wraparound VACUUM FREEZE (probe)" ;;
         *)   echo "Unknown scenario $1" ;;
     esac
 }
@@ -152,7 +152,7 @@ main() {
 
     local -a missing_list=()  # human-readable list of unavailable scenario IDs
 
-    for N in 1 2 3 4 7 8 9 14; do
+    for N in 1 2 3 4 7 8 9 14 15; do
         local rw_f="${RESULTS_DIR}/s${N}_remote_write.log"
         local ra_f="${RESULTS_DIR}/s${N}_remote_apply.log"
         local name
@@ -422,32 +422,7 @@ main() {
         missing_list+=("S12")
     fi
 
-    # S15 — VACUUM FREEZE wall time
-    local s15_rw_f="${RESULTS_DIR}/s15_remote_write.log"
-    local s15_ra_f="${RESULTS_DIR}/s15_remote_apply.log"
-    if [ -f "$s15_rw_f" ] && [ -f "$s15_ra_f" ]; then
-        local s15_rw s15_ra
-        s15_rw=$(parse_wall_time "$s15_rw_f" "VACUUM FREEZE wall time")
-        s15_ra=$(parse_wall_time "$s15_ra_f" "VACUUM FREEZE wall time")
-        if [ -n "$s15_rw" ] && [ -n "$s15_ra" ]; then
-            local s15_added s15_added_fmt s15_neg
-            s15_added=$(awk_sub "$s15_ra" "$s15_rw")
-            s15_neg=$(awk "BEGIN { print ($s15_added < 0) ? 1 : 0 }")
-            if [ "$s15_neg" = "1" ]; then
-                s15_added_fmt="$s15_added"
-            else
-                s15_added_fmt="+${s15_added}"
-            fi
-            printf "  %4s  %-36s  %7s  %8s  %8s\n" \
-                "15" "$(scenario_name 15)" \
-                "$s15_rw" "$s15_ra" "$s15_added_fmt"
-        else
-            printf "  ${C_RED}%4s  %-36s  %7s  %8s  %8s${C_RESET}\n" \
-                "15" "$(scenario_name 15)" "ERR" "ERR" "parse error"
-        fi
-    else
-        missing_list+=("S15")
-    fi
+    # S15 is now a pgbench scenario — handled in the loop above
 
     printf "\n"
 

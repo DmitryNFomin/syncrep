@@ -1,13 +1,13 @@
--- pgbench script: batch INSERT of 8 tickets with large TOAST bodies and GIN entries.
+-- pgbench script: batch INSERT of 30 tickets with large TOAST bodies and GIN entries.
 --
--- Each execution inserts 8 rows in one transaction, generating:
---   8 × heap INSERT with TOAST (10-30 KB per row = 80-240 KB TOAST WAL)
---   8 × GIN pending list entries for body_tsv, tags, metadata, title_trgm
---   8 × btree inserts for project_id, created_at, PK
+-- Each execution inserts 30 rows in one transaction, generating:
+--   30 × heap INSERT with TOAST (10-30 KB per row = 300-900 KB TOAST WAL)
+--   30 × GIN pending list entries for body_tsv, tags, metadata, title_trgm
+--   30 × btree inserts for project_id, created_at, PK
 --
--- GIN pending list flushes happen ~8x more often per commit (8 rows fill
--- the 64 KB gin_pending_list_limit faster), creating expensive replay
--- bursts. Each single-row INSERT added +1.2ms; 8 rows → ~+10ms.
+-- 30 rows per commit fills the 64 KB gin_pending_list_limit multiple times,
+-- triggering frequent GIN flushes with expensive posting tree traversal.
+-- Each flush generates CPU-bound replay work that scales poorly on fast HW.
 
 \set proj random(1, 100)
 
@@ -48,4 +48,4 @@ SELECT
         (ARRAY['p0','p1','p2','p3'])[1+(random()*3)::int],
         'proj-' || ((:proj + i) % 100 + 1)
     ]
-FROM generate_series(1, 8) i;
+FROM generate_series(1, 30) i;

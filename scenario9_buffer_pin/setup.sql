@@ -16,9 +16,10 @@
 -- Each such collision costs up to one scan iteration worth of wait time.
 --
 -- TUNING FOR HIGH-SPEC HARDWARE:
--- Fewer pages (~1000) + many scanners (80) + expensive per-row work = high
--- collision probability. With P≈16%, ~1000 pages × 0.16 = 160 collisions,
--- each costing ~200μs of pin hold time → ~32ms total added delay.
+-- Fewer pages (~1000) + 20 scanners + expensive per-row work = moderate
+-- collision probability. On fast CPUs, scan cycle ≈ 20ms (not 100ms),
+-- so P ≈ 20 × 200μs / 20ms ≈ 20%. 80 scanners caused 100% collision
+-- (complete replay stall) on beefy hardware.
 --
 -- The effect is amplified by running a CHECKPOINT before VACUUM FREEZE:
 -- PostgreSQL's full_page_writes means the first modification to each page after

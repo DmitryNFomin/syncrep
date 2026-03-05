@@ -311,8 +311,10 @@ scenario2() {
 # ══════════════════════════════════════════════════════════════════════════════
 scenario3() {
     hdr "SCENARIO 3: GIN + TOAST bursty replay"
-    echo "  Strategy: 70% INSERT / 30% UPDATE, 8 rows per commit,"
+    echo "  Strategy: 70% INSERT / 30% UPDATE, 30 rows per commit,"
     echo "  with large TOAST bodies and 4 GIN indexes (gin_pending_list_limit=64)."
+    echo "  UPDATE rows are scattered across the table (spaced 10K apart) to"
+    echo "  maximize distinct page modifications per commit."
     echo "  GIN pending-list flushes are CPU-intensive (posting tree traversal,"
     echo "  compression) — faster NVMe doesn't help, replay is CPU-bound."
     echo ""
@@ -329,11 +331,11 @@ scenario3() {
         $PSQL -c "CHECKPOINT;" >/dev/null
         sleep 2
 
-        log "Running mixed workload (12 clients, 45s)..."
+        log "Running mixed workload (24 clients, 45s)..."
         $PGBENCH \
             -f $SQL_DIR/scenario3_gin_toast/workload_insert.sql@7 \
             -f $SQL_DIR/scenario3_gin_toast/workload_update.sql@3 \
-            -c 12 -j 4 -T 45 -P 5 --progress-timestamp 2>&1 \
+            -c 24 -j 8 -T 45 -P 5 --progress-timestamp 2>&1 \
             | tee "$RESULTS_DIR/s3_${MODE}.log"
 
         show_repl
@@ -350,13 +352,14 @@ scenario3() {
 # ══════════════════════════════════════════════════════════════════════════════
 scenario4() {
     hdr "SCENARIO 4: Schema migration"
-    echo "  Strategy: UPDATE 2M rows + CREATE INDEX while OLTP runs."
-    echo "  The UPDATE generates a massive WAL burst (~1GB); standby's"
-    echo "  single-threaded replay can't keep up → remote_apply commits stall."
+    echo "  Strategy: UPDATE 2M rows (touching indexed columns) + CREATE INDEX."
+    echo "  4 secondary indexes at setup → every row UPDATE generates ~6 WAL"
+    echo "  records (heap + 5 index updates) = ~12M replay operations total."
+    echo "  Standby's single-threaded replay can't keep up → remote_apply stalls."
     echo ""
 
     set_sync_mode "local"
-    log "Loading data (2M rows — takes ~30s)..."
+    log "Loading data (2M rows + 4 indexes — takes ~60s)..."
     $PSQL -f $SQL_DIR/scenario4_create_index/setup.sql >/dev/null 2>&1
     set_sync_mode "remote_write"
     wait_for_catchup
@@ -372,10 +375,10 @@ scenario4() {
               -c "DROP INDEX IF EXISTS events_svc_dur" >/dev/null 2>&1
         sleep 3
 
-        log "Starting probe pgbench (8 clients, 30s)..."
+        log "Starting probe pgbench (16 clients, 60s)..."
         $PGBENCH \
             -f $SQL_DIR/scenario4_create_index/workload_probe.sql \
-            -c 8 -j 4 -T 30 -P 5 --progress-timestamp 2>&1 \
+            -c 16 -j 8 -T 60 -P 5 --progress-timestamp 2>&1 \
             > "$RESULTS_DIR/s4_${MODE}.log" &
         PGBENCH_PID=$!
 
@@ -386,7 +389,7 @@ scenario4() {
 
         $PSQL -c "SET synchronous_commit TO local" \
               -c "SET maintenance_work_mem = '256MB'" \
-              -c "UPDATE events SET payload = upper(payload)" 2>&1
+              -c "UPDATE events SET user_id = user_id + 1, duration_ms = duration_ms + 1, payload = upper(payload)" 2>&1
         log "  UPDATE done ($(( $(date +%s) - t0 ))s elapsed)"
 
         $PSQL -c "SET synchronous_commit TO local" \
@@ -406,8 +409,8 @@ scenario4() {
         $PSQL -c "SET synchronous_commit TO local" \
               -c "DROP INDEX IF EXISTS events_ts_user" \
               -c "DROP INDEX IF EXISTS events_svc_dur" \
-              -c "UPDATE events SET payload = lower(payload)" >/dev/null 2>&1
-        wait_for_catchup 180
+              -c "UPDATE events SET user_id = user_id - 1, duration_ms = duration_ms - 1, payload = lower(payload)" >/dev/null 2>&1
+        wait_for_catchup 300
     done
 
     print_comparison "SCENARIO 4" "$RESULTS_DIR/s4_remote_write.log" \
@@ -698,11 +701,11 @@ scenario9() {
     echo "  With max_standby_streaming_delay=-1, the startup process waits for"
     echo "  ALL pins on that buffer to drop before acquiring the cleanup lock."
     echo ""
-    echo "  Tuned for high-spec HW: compact table (~1000 pages) + 80 scanners"
+    echo "  Tuned for high-spec HW: compact table (~1000 pages) + 20 scanners"
     echo "  doing expensive per-row work (sum(length(a)+length(b)+length(c)))."
-    echo "  Each scanner holds a pin ~200μs per page; with 80 scanners cycling"
-    echo "  through 1000 pages in ~100ms, collision probability P ≈ 16%."
-    echo "  ~160 collisions × ~200μs wait each ≈ 32ms added per VACUUM FREEZE."
+    echo "  On beefy HW, scanners cycle through 1000 pages in ~20ms (fast CPUs)."
+    echo "  P(collision) ≈ 20 × 200μs / 20ms ≈ 20% — significant but non-blocking."
+    echo "  ~200 collisions per freeze × wait time ≈ tens of ms added per cycle."
     echo ""
     echo "  Unlike scenarios 2/7 (one snapshot blocks all replay for 90s),"
     echo "  this produces many small per-page stalls that aggregate to seconds."
@@ -733,14 +736,15 @@ scenario9() {
                   UPDATE freeze_test SET b = repeat(chr(65 + (id % 26)::int), 500)
                   WHERE id % 3 = 0;" >/dev/null
 
-        # Start 80 parallel full-table scans on standby to build buffer pin pressure.
+        # Start 20 parallel full-table scans on standby to build buffer pin pressure.
         # Each scan processes ~1000 pages with expensive per-row computation
         # (sum of length() on 3 wide text columns), holding pins ~200μs per page.
-        # P(collision) ≈ 80 × 200μs / 100ms ≈ 16%.
-        log "Starting 80 parallel full-table scans on standby (pin pressure)..."
+        # On beefy HW, scan cycle ≈ 20ms → P(collision) ≈ 20 × 200μs / 20ms ≈ 20%.
+        # 80 scanners caused 100% collision (complete stall) on fast hardware.
+        log "Starting 20 parallel full-table scans on standby (pin pressure)..."
         $PGBENCH_S \
             -f $SQL_DIR/scenario9_buffer_pin/standby_scanner.sql \
-            -c 80 -j 8 -T 75 --no-vacuum 2>/dev/null &
+            -c 20 -j 4 -T 75 --no-vacuum 2>/dev/null &
         SCANNER_PID=$!
         sleep 3  # let scanners get going
 
@@ -1092,18 +1096,19 @@ scenario13() {
 scenario14() {
     hdr "SCENARIO 14: Replay throughput saturation — single-threaded replay ceiling"
     echo "  Mechanism: WAL replay is single-threaded (one startup process)."
-    echo "  Each 5-row UPDATE modifies 4 indexes → 20 index mods per commit."
+    echo "  Each commit updates 50 rows SCATTERED across the table × 11 indexes"
+    echo "  = ~550 distinct page modifications → ~300 KB WAL per commit."
     echo ""
     echo "  remote_write: primary waits only for WAL bytes to reach standby memory."
     echo "  remote_apply: every commit competes for the same single replay thread."
     echo ""
-    echo "  At low concurrency replay keeps up. As concurrency rises, WAL generation"
-    echo "  approaches replay throughput → commits queue behind the startup process"
-    echo "  → added latency climbs. This is the hard ceiling remote_apply hits."
+    echo "  At low concurrency replay keeps up. As concurrency rises, combined WAL"
+    echo "  generation from all clients approaches single-threaded replay throughput"
+    echo "  → commits queue behind the startup process → added latency climbs."
     echo ""
 
     set_sync_mode "local"
-    log "Loading saturation_test (100K wide rows, ~50 MB — takes ~5s)..."
+    log "Loading saturation_test (500K rows, 10 indexes — takes ~30s)..."
     $PSQL -f "$SQL_DIR/scenario14_replay_saturation/setup.sql" >/dev/null 2>&1
     set_sync_mode "remote_write"
     wait_for_catchup 60
@@ -1154,7 +1159,7 @@ scenario14() {
     echo ""
     echo "  Growing added_ms with client count = replay saturation onset."
     echo "  Flat added_ms = replay keeps up; all overhead is network RTT."
-    echo "  5 rows × 4 indexes per commit = 20 index mods → heavier replay."
+    echo "  50 scattered rows × 11 indexes = ~550 page mods per commit."
     echo ""
 }
 
@@ -1163,58 +1168,66 @@ scenario14() {
 # ══════════════════════════════════════════════════════════════════════════════
 scenario15() {
     hdr "SCENARIO 15: Anti-wraparound VACUUM — large WAL volume, zero conflicts"
-    echo "  Mechanism: VACUUM FREEZE writes XLOG_HEAP2_FREEZE_PAGE for every page"
-    echo "  in the table regardless of whether any standby queries are running."
+    echo "  Mechanism: VACUUM FREEZE writes XLOG_HEAP2_FREEZE_PAGE for every page."
     echo "  Anti-wraparound autovacuum bypasses cost delay and cannot be cancelled,"
     echo "  generating WAL proportional to table size at full I/O speed."
     echo ""
-    echo "  A CHECKPOINT immediately before VACUUM FREEZE causes it to emit a"
-    echo "  full-page image (8 KB) for every page it touches — amplifying WAL"
-    echo "  volume to match the on-disk table size. This mirrors production"
-    echo "  conditions where anti-wraparound fires after a recent checkpoint."
+    echo "  A CHECKPOINT before VACUUM FREEZE causes full-page images (8 KB each)"
+    echo "  for every page touched — amplifying WAL to match on-disk table size."
     echo ""
-    echo "  remote_write: VACUUM FREEZE commit returns instantly; replay is async."
-    echo "  remote_apply: primary waits until standby replays ALL FREEZE_PAGE + FPI"
-    echo "  records before returning. No conflicts — pure replay throughput limit."
+    echo "  Measurement: pgbench probe on a SEPARATE table runs during VACUUM FREEZE."
+    echo "  Under remote_apply, probe commits must wait for VACUUM's FREEZE_PAGE WAL"
+    echo "  to be replayed before the probe's commit position is reached."
     echo ""
-    echo "  SCALE:"
-    echo "    1 TB table  → ~130M pages → ~1 TB of FPI WAL per VACUUM FREEZE."
-    echo "    At 300 MB/s replay: ~55 minutes of remote_apply stall."
-    echo "    This is a recurring, automatic, unavoidable event on large tables."
+    echo "  SCALE: 1 TB table → ~130M pages → ~1 TB of FPI WAL per VACUUM FREEZE."
+    echo "  At 300 MB/s replay: ~55 minutes of remote_apply stall."
     echo ""
 
     set_sync_mode "local"
-    log "Loading antiwrap_test (2M rows, ~700 MB — takes ~60s)..."
+    log "Loading antiwrap_test (5M rows — takes ~120s)..."
     $PSQL -f "$SQL_DIR/scenario15_antiwrap_vacuum/setup.sql" >/dev/null 2>&1
     set_sync_mode "remote_write"
-    wait_for_catchup 300
+    wait_for_catchup 600
 
     for MODE in remote_write remote_apply; do
         log "── $MODE ──"
 
-        # Update 50% of rows to ensure unfrozen tuples exist.
-        # VACUUM FREEZE skips already-frozen tuples; we need live unfrozen work.
+        # Update ALL rows to ensure every page has unfrozen tuples.
+        # Use deterministic transformation so both modes see identical work.
         set_sync_mode "local"
-        log "Updating 50% of rows to create unfrozen tuples (local sync, ~30s)..."
-        $PSQL -c "UPDATE antiwrap_test
-                  SET payload = md5(id::text || 'x')
-                  WHERE id % 2 = 0;" >/dev/null
+        log "Updating all rows to create unfrozen tuples (local sync, ~60s)..."
+        $PSQL -c "UPDATE antiwrap_test SET payload = md5(id::text || '${MODE}');" >/dev/null
 
-        # CHECKPOINT forces a full-page image on the next write to every page,
-        # amplifying WAL volume to simulate production anti-wraparound density.
-        log "CHECKPOINT (forces FPIs on next VACUUM FREEZE — amplifies WAL)..."
+        # CHECKPOINT forces FPI on the next write to every page.
+        log "CHECKPOINT (forces FPIs on next VACUUM FREEZE)..."
         $PSQL -c "CHECKPOINT;" >/dev/null
+        wait_for_catchup 600
         sleep 2
 
+        set_sync_mode "$MODE"
+
+        # Start probe pgbench — measures commit latency during VACUUM FREEZE
+        log "Starting probe pgbench (8 clients, 60s)..."
+        $PGBENCH \
+            -f "$SQL_DIR/scenario15_antiwrap_vacuum/workload_probe.sql" \
+            -c 8 -j 4 -T 60 -P 5 --progress-timestamp 2>&1 \
+            | tee "$RESULTS_DIR/s15_${MODE}.log" &
+        PGBENCH_PID=$!
+
+        sleep 5
+
+        # Run VACUUM FREEZE in background with local sync.
+        # It generates FREEZE_PAGE WAL for every page; replay must process all
+        # of this before reaching the probe's commit records in the WAL stream.
         local lsn_before
         lsn_before=$($PSQL -tAc "SELECT pg_current_wal_lsn();" 2>/dev/null \
                      || echo "0/0")
 
-        set_sync_mode "$MODE"
-        log "Timing VACUUM FREEZE antiwrap_test (vacuum_freeze_min_age=0)..."
+        log "Running VACUUM FREEZE (local sync, generates heavy WAL)..."
         local t0_ms
         t0_ms=$(date +%s%3N)
         $PSQL -c "SET vacuum_freeze_min_age = 0" \
+              -c "SET synchronous_commit TO local" \
               -c "VACUUM FREEZE antiwrap_test" >/dev/null
         local elapsed_ms=$(( $(date +%s%3N) - t0_ms ))
 
@@ -1224,30 +1237,18 @@ scenario15() {
                  pg_wal_lsn_diff(pg_current_wal_lsn(), '${lsn_before}'));" \
             2>/dev/null || echo "N/A")
 
-        echo ""
-        echo "  VACUUM FREEZE wall time (${MODE}): ${elapsed_ms} ms" \
-            | tee    "$RESULTS_DIR/s15_${MODE}.log"
-        echo "  WAL generated: ${wal_generated}" \
-            | tee -a "$RESULTS_DIR/s15_${MODE}.log"
+        log "  VACUUM FREEZE done in ${elapsed_ms}ms, WAL generated: ${wal_generated}"
+
+        log "Waiting for pgbench to finish..."
+        wait $PGBENCH_PID || true
+
         show_repl
         wait_for_catchup 600
         echo ""
     done
 
-    hdr "SCENARIO 15 — RESULTS"
-    echo "  Wall-clock = VACUUM FREEZE execution + commit wait."
-    echo "  remote_apply overhead = time to replay all FREEZE_PAGE + FPI WAL."
-    echo "  No standby queries running — zero conflicts, pure replay throughput."
-    echo ""
-    for MODE in remote_write remote_apply; do
-        local t wal
-        t=$(grep   "VACUUM FREEZE wall time" "$RESULTS_DIR/s15_${MODE}.log" \
-            | awk '{print $(NF-1), $NF}')
-        wal=$(grep "WAL generated"           "$RESULTS_DIR/s15_${MODE}.log" \
-            | awk -F': ' '{print $2}')
-        printf "  %-15s: %-20s  WAL generated: %s\n" "$MODE" "$t" "$wal"
-    done
-    echo ""
+    print_comparison "SCENARIO 15" "$RESULTS_DIR/s15_remote_write.log" \
+                     "$RESULTS_DIR/s15_remote_apply.log" 1.2
 }
 
 # ── MAIN ─────────────────────────────────────────────────────────────────────

@@ -1,14 +1,18 @@
--- pgbench script: batch UPDATE of 8 tickets (TOAST rewrite + GIN update).
+-- pgbench script: batch UPDATE of 30 SCATTERED tickets (TOAST rewrite + GIN update).
 --
--- Updates 8 contiguous rows per commit. For each row:
+-- Updates 30 rows SCATTERED across the 300K-row table (spaced 10,000 apart).
+-- Each row lands on a different heap page and different GIN/btree leaf pages.
+-- For each row:
 --   1. Old TOAST chunks freed, new ones written (10-30 KB per row)
 --   2. Old tsvector/tags/metadata GIN entries marked for cleanup
 --   3. New GIN entries added to pending lists → triggers flushes
 --   4. All replayed serially through one startup process
 --
--- 8 rows × GIN + TOAST overhead ≈ +10ms added latency per commit.
+-- 30 scattered rows × (TOAST + 4 GIN indexes + 2 btree) ≈ 180+ distinct page
+-- modifications per commit. Each page modification during replay requires a
+-- buffer lookup + apply. Replay must process all serially.
 
-\set start random(1, 299992)
+\set seed random(1, 10000)
 \set proj random(1, 100)
 
 UPDATE tickets
@@ -33,4 +37,7 @@ SET body = repeat(
         (ARRAY['p0','p1','p2','p3'])[1+(random()*3)::int],
         'proj-' || :proj
     ]
-WHERE id BETWEEN :start AND :start + 7;
+WHERE id IN (
+    SELECT :seed + (i - 1) * 10000
+    FROM generate_series(1, 30) i
+);

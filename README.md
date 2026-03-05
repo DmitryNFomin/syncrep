@@ -242,7 +242,7 @@ bash report.sh       # re-run any time; reads whatever result files exist
 
 ---
 
-### S1 — Index-heavy scattered UPDATE (50 rows × 15 indexes)
+### S1 — Index-heavy scattered UPDATE (100 rows × 15 indexes)
 
 ```bash
 bash run.sh 1   # ~3 min
@@ -251,13 +251,13 @@ bash run.sh 1   # ~3 min
 **Setup**: 2 M-row table with 15 B-tree indexes (8 per-column, 4 composite,
 3 functional), fillfactor 50.
 
-**What it does**: Each pgbench transaction updates 50 rows **scattered** across
-the full table (spaced ~40,000 apart). Unlike contiguous `BETWEEN` ranges
-where 25 rows share 2-3 heap pages, scattered rows each land on a different
-heap page and different index leaf pages. Runs 45 s at 16 clients.
+**What it does**: Each pgbench transaction updates 100 rows **scattered** across
+the full table (spaced ~20,000 apart). Unlike contiguous `BETWEEN` ranges
+where rows share heap pages, scattered rows each land on a different heap page
+and different index leaf pages. Runs 45 s at 32 clients.
 
-**Why latency increases**: 50 scattered rows × 15 indexes ≈ 800 distinct page
-modifications per commit. Each page modification during replay requires a
+**Why latency increases**: 100 scattered rows × 15 indexes ≈ 1,600 distinct
+page modifications per commit. Each page modification during replay requires a
 buffer lookup and apply. Contiguous rows share pages (fast); scattered rows
 force random buffer access (slow). The replay overhead per commit is
 proportional to the number of *distinct pages* modified, not just row count.
@@ -265,12 +265,12 @@ proportional to the number of *distinct pages* modified, not just row count.
 **What to look for**:
 ```
 avg latency (ms)       remote_write   remote_apply
-                             2.1            14.5
-Added latency: +12.4 ms
+                             2.1            41.5
+Added latency: +39.4 ms
 ```
 The per-5 s progress lines should stay stable — no spikes.
 
-**Typical result**: +10–15 ms
+**Typical result**: +20–40 ms
 
 ---
 
@@ -307,52 +307,57 @@ WAL backlog.
 
 ---
 
-### S3 — GIN + TOAST batch (8 rows)
+### S3 — GIN + TOAST batch (30 rows scattered)
 
 ```bash
 bash run.sh 3   # ~4 min
 ```
 
 **Setup**: `tickets` table with four GIN indexes (text search, trigrams, tags
-array, metadata jsonb). Rows contain 1–5 KB of text stored via TOAST.
+array, metadata jsonb). Rows contain 10–30 KB of text stored via TOAST.
+`gin_pending_list_limit = 64 KB` for frequent flushes.
 
-**What it does**: Each pgbench transaction inserts or updates 8 rows with large
-text bodies. GIN pending-list flushes are CPU-intensive on replay (posting tree
-traversal, compression). TOAST chunks generate many small WAL records per row.
+**What it does**: 70/30 mix of INSERT (30 rows) and UPDATE (30 scattered rows).
+UPDATE rows are spaced 10,000 apart across the 300K-row table, hitting
+different heap pages and GIN/btree leaf pages. 24 clients, 45 s per mode.
 
-**Why latency increases**: GIN replay is CPU-bound, not I/O-bound. Each 8-row
-batch triggers GIN pending-list flush WAL that requires expensive posting tree
-operations during single-threaded replay.
+**Why latency increases**: GIN replay is CPU-bound, not I/O-bound. Each 30-row
+batch fills the GIN pending list multiple times, triggering CPU-intensive
+posting tree flushes. Scattered UPDATEs multiply distinct page modifications.
+TOAST chunks generate many small WAL records per row.
 
 **What to look for**: Per-5 s progress lines that are slightly uneven — bursty
 WAL causes small latency spikes when GIN flushes its pending list.
 
-**Typical result**: +10–15 ms
+**Typical result**: +10–20 ms
 
 ---
 
-### S4 — Schema migration (CREATE INDEX CONCURRENTLY)
+### S4 — Schema migration (UPDATE + CREATE INDEX)
 
 ```bash
-bash run.sh 4   # ~5 min
+bash run.sh 4   # ~8 min
 ```
 
-**Setup**: `events` table (500 K rows, 4 columns). A probe table (`probe_s4`)
-takes the latency measurement while the index builds.
+**Setup**: `events` table (2 M rows) with 4 secondary B-tree indexes on
+`(user_id, ts)`, `(duration_ms)`, `(service, ts)`, `(user_id, duration_ms)`.
+A probe table (`probe_s4`) takes the latency measurement.
 
-**What it does**: Runs `CREATE INDEX CONCURRENTLY` on the primary while
-simultaneously running a pgbench workload (30 s, 8 clients on `probe_s4`).
+**What it does**: While a pgbench probe runs (16 clients, 60 s), a migration
+UPDATEs all 2 M rows (touching indexed columns `user_id` and `duration_ms`)
+then creates 2 more indexes. The UPDATE forces non-HOT updates (changing
+indexed columns makes it all-or-nothing), so every row generates ~6 WAL
+records (heap + 5 index updates) = ~12 M replay operations.
 
-**Why latency increases**: Replay must rebuild the entire index from the WAL
-on the standby. This is sequential, I/O-bound work — no conflict, just time.
-Every commit during index build replay waits.
+**Why latency increases**: Single-threaded replay must process 12 M WAL records
+serially. Each record requires a buffer lookup + lock + apply. On fast hardware
+this still takes tens of seconds, during which all `remote_apply` probe commits
+must wait for the replay to reach their position in the WAL stream.
 
-**What to look for**: A consistent latency elevation for the full duration of
-the CREATE INDEX (visible in progress lines), dropping back to baseline after
-the index is built. The `replay_lag` bytes column in `pg_stat_replication` will
-stay elevated while the index WAL replays.
+**What to look for**: Sustained latency elevation during the UPDATE phase
+(visible in progress lines), then a second bump during index creation.
 
-**Typical result**: +15–30 ms during index build; larger on bigger tables
+**Typical result**: +10–30 ms during migration
 
 ---
 
@@ -562,37 +567,37 @@ seconds to minutes of stall every time the table is vacuumed.
 
 ---
 
-### S14 — Replay throughput saturation (5-row × 4 idx, high concurrency)
+### S14 — Replay throughput saturation (50-row scattered × 11 idx)
 
 ```bash
 bash run.sh 14   # ~15 min (8 concurrency levels × 2 modes × 20 s each + catchup)
 ```
 
-**Setup**: `saturation_test` table (100 K rows, 3 secondary indexes + PK).
-Each transaction updates 5 contiguous rows, modifying both text columns
-and a counter — touching all 4 indexes per row.
+**Setup**: `saturation_test` table (500 K rows, 10 secondary indexes + PK).
+Each transaction updates 50 rows **scattered** 10,000 apart, modifying all
+indexed columns — touching all 11 indexes per row (non-HOT).
 
 **What it does**: Runs pgbench at 1, 2, 4, 8, 16, 32, 64, then 128 clients
 under each sync mode (20 s per level). Prints a concurrency vs latency table
 for both modes side by side.
 
 **Mechanism**: WAL replay is **single-threaded**. Each commit generates
-5 rows × 4 indexes = 20 index modifications of replay work. As primary
-concurrency grows, WAL generation rate exceeds single-threaded replay
-throughput. Under `remote_apply`, each commit must wait in a growing queue.
-Under `remote_write`, commits only wait for WAL bytes to arrive in standby
-memory.
+50 scattered rows × 11 indexes = ~550 distinct page modifications → ~300 KB
+WAL per commit. As primary concurrency grows, combined WAL generation from all
+clients exceeds single-threaded replay throughput. Under `remote_apply`, each
+commit must wait in a growing queue. Under `remote_write`, commits only wait
+for WAL bytes to arrive in standby memory.
 
 **What to look for**:
 ```
   clients   remote_write   remote_apply   added_ms
   -------   ------------   ------------   --------
-        1         112.1          113.4       +1.3
-        4         113.2          116.8       +3.6
-       16         115.0          128.4      +13.4
-       32         118.1          147.3      +29.2
-       64         120.5          183.6      +63.1
-      128         125.2          245.8     +120.6
+        1          25.0           26.5       +1.5
+        4          26.1           30.8       +4.7
+       16          28.0           42.4      +14.4
+       32          30.1           60.3      +30.2
+       64          35.5           95.6      +60.1
+      128          45.2          165.8     +120.6
 ```
 `remote_write` latency stays flat or grows slowly (CPU contention).
 `remote_apply` latency grows faster — the gap (`added_ms`) increasing with
@@ -608,48 +613,35 @@ not exist under `remote_write`.
 
 ---
 
-### S15 — Anti-wraparound VACUUM (large WAL volume, zero conflicts)
+### S15 — Anti-wraparound VACUUM (probe-based, zero conflicts)
 
 ```bash
-bash run.sh 15   # ~15 min (2 M-row table load ~60 s, then 2× UPDATE + CHECKPOINT + VACUUM FREEZE)
+bash run.sh 15   # ~15 min (5 M-row table load, then 2× UPDATE + CHECKPOINT + VACUUM FREEZE)
 ```
 
-**Setup**: `antiwrap_test` table (2 M rows, ~700 MB on disk: bigint PK +
-md5 payload + 300-char filler).
+**Setup**: `antiwrap_test` table (5 M rows: bigint PK + md5 payload +
+300-char filler). A probe table (`probe_s15`) takes the latency measurement.
 
 **What it does**:
-1. Updates 50% of rows (creates unfrozen tuples for VACUUM FREEZE to process).
-2. Runs `CHECKPOINT` — marks all pages "clean" so the next write emits a
-   full-page image (FPI).
-3. Runs `VACUUM FREEZE antiwrap_test` with `vacuum_freeze_min_age = 0` —
-   forces it to process every page, emitting both a `XLOG_HEAP2_FREEZE_PAGE`
-   record **and** an 8 KB FPI per page.
-4. Measures wall-clock time for the commit to return under each sync mode.
-5. Reports total WAL generated.
+1. Updates all rows deterministically (creates unfrozen tuples).
+2. Runs `CHECKPOINT` — marks all pages "clean" so VACUUM FREEZE emits FPIs.
+3. Starts a pgbench probe (8 clients, 60 s) measuring INSERT latency on
+   `probe_s15`.
+4. After 5 s, runs `VACUUM FREEZE antiwrap_test` with `local` sync — generates
+   FREEZE_PAGE + FPI WAL for every page.
+5. Under `remote_apply`, probe commits must wait for the VACUUM's WAL to be
+   replayed before the probe's commit position is reached.
 
-No standby queries run. This is a pure replay throughput test — no conflicts.
+**Mechanism**: Anti-wraparound autovacuum generates WAL proportional to table
+size at full I/O speed. A `CHECKPOINT` before VACUUM FREEZE amplifies WAL
+(8 KB FPI per page). The VACUUM WAL is interleaved with probe commit records
+in the WAL stream. Under `remote_apply`, each probe commit must wait for
+preceding VACUUM WAL to be replayed.
 
-**Mechanism**: Anti-wraparound autovacuum triggers when `relfrozenxid` is close
-to `autovacuum_freeze_max_age` (default 200 M transactions), bypasses
-`autovacuum_vacuum_cost_delay` (runs at full I/O speed), and cannot be
-cancelled. The FPI amplification makes WAL volume ≈ table size.
+**What to look for**: Elevated latency in pgbench progress lines during the
+VACUUM FREEZE window, dropping back to baseline after VACUUM finishes.
 
-Under `remote_write`, the commit returns immediately — replay happens async in
-the background. Under `remote_apply`, the primary blocks until the standby has
-replayed every FREEZE_PAGE + FPI record.
-
-**What to look for**:
-```
-  remote_write:   3241 ms    WAL generated: 712 MB
-  remote_apply:   7854 ms    WAL generated: 712 MB    (+4613 ms)
-```
-Both modes show the same WAL volume (the WAL is generated by the primary
-regardless of sync mode). The difference is entirely the standby's replay time.
-Dividing `added_ms` by the WAL size gives your standby's effective replay
-throughput for FPI-heavy workloads.
-
-**Typical result**: ~4–10 s added latency on a 700 MB table (depends on
-standby I/O throughput)
+**Typical result**: +10–30 ms during VACUUM FREEZE
 
 **Scale**:
 
@@ -745,8 +737,8 @@ overhead (S10–S12, S14–S15) are unaffected regardless of this setting.
      2  Blocked replay (snapshot conflict)      BLOCKED ← 0 TPS for 65/70s (340x TPS drop)
      7  Reporting query (cross-table blast)     BLOCKED ← 0 TPS for 80/85s (350x TPS drop)
      8  Table rewrite / lock conflict           BLOCKED ← 0 TPS for 60/70s (170x TPS drop)
-     1  Index-heavy batch UPDATE (25 rows)      110.2     122.5    +12.3
-     3  GIN + TOAST batch (8 rows)              108.4     119.7    +11.3
+     1  Index-heavy scattered UPDATE (100 rows)  110.2     149.6    +39.4
+     3  GIN + TOAST batch (30 rows scattered)   108.4     119.7    +11.3
      9  Buffer pin (VACUUM FREEZE)              107.6     128.2    +20.6
 ```
 

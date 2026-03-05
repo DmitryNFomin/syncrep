@@ -7,9 +7,9 @@
 -- forces the backend to decompress/access the full inline text data for each
 -- row, extending the pin hold time per page to ~200μs instead of ~10μs.
 --
--- Run 80 parallel copies to create sustained pin pressure: at any moment,
--- P ≈ scanners × pin_duration / scan_cycle_time ≈ 80 × 200μs / 100ms ≈ 16%.
--- This means ~160 of the ~1000 pages will have a pin collision during
--- VACUUM FREEZE replay, each costing one scan cycle of wait time.
+-- Run 20 parallel copies to create sustained pin pressure. On beefy HW,
+-- scan cycle ≈ 20ms → P ≈ 20 × 200μs / 20ms ≈ 20%.
+-- ~200 of ~1000 pages will collide during VACUUM FREEZE replay.
+-- (80 scanners caused 100% collision = complete replay stall on fast HW.)
 
 SELECT sum(length(a) + length(b) + length(c)) FROM freeze_test;

@@ -13,7 +13,8 @@ DROP TABLE IF EXISTS probe_s4 CASCADE;
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
 
 -- 2M rows, ~200 bytes per row → ~400 MB heap
--- NO secondary indexes at setup time — those are created during the test
+-- Secondary indexes at setup → UPDATE during migration must update all of them,
+-- generating ~6 WAL records per row (heap + 5 indexes) = 12M replay operations.
 CREATE TABLE events (
     id          bigserial PRIMARY KEY,
     ts          timestamptz NOT NULL,
@@ -31,6 +32,14 @@ SELECT
     (random() * 5000)::int,
     md5(random()::text) || '-' || md5(random()::text) || '-' || md5(random()::text)
 FROM generate_series(1, 2000000);
+
+-- Secondary indexes: force non-HOT updates during migration.
+-- The migration UPDATE changes user_id and duration_ms, which forces
+-- index entry updates on ALL indexes (non-HOT is all-or-nothing).
+CREATE INDEX events_user_ts   ON events(user_id, ts);
+CREATE INDEX events_dur       ON events(duration_ms);
+CREATE INDEX events_svc_ts    ON events(service, ts);
+CREATE INDEX events_user_dur  ON events(user_id, duration_ms);
 
 -- Probe table: tiny, simple — measures raw commit latency
 CREATE TABLE probe_s4 (
