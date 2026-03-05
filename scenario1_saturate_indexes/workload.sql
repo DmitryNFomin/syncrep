@@ -1,11 +1,14 @@
--- pgbench custom script: random UPDATE on the heavily-indexed table.
+-- pgbench custom script: batch UPDATE on the heavily-indexed table.
 --
--- Each execution updates ONE row but modifies 6 indexed columns → the startup
--- process must update heap + 10 index entries (every secondary index whose
--- key column changed, plus the composites). With random keys the touched index
--- pages are scattered, causing random I/O on replay.
+-- Each execution updates 25 rows, modifying 6 indexed columns per row.
+-- With 15 secondary indexes, this generates ~375 index modifications per
+-- commit (25 rows × 15 indexes). The primary executes this in parallel
+-- across backends; the standby replays ALL 375 index updates serially
+-- through the single startup process.
+--
+-- 375 index mods × ~27μs each ≈ 10ms of replay overhead per commit.
 
-\set id random(1, 2000000)
+\set start random(1, 1999975)
 \set v1 random(1, 1000000)
 \set v2 random(1, 1000000)
 \set v3 random(1, 1000000)
@@ -22,4 +25,4 @@ UPDATE idx_heavy
        val5   = :v5,
        val6   = :v6,
        status = :st
- WHERE id = :id;
+ WHERE id BETWEEN :start AND :start + 24;

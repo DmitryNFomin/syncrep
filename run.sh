@@ -199,9 +199,10 @@ print_blocking_comparison() {
 # SCENARIO 1: Index-heavy UPDATE saturation
 # ══════════════════════════════════════════════════════════════════════════════
 scenario1() {
-    hdr "SCENARIO 1: Index-heavy UPDATE saturation"
-    echo "  Strategy: 32 clients UPDATE rows with 15 indexes."
-    echo "  Single-threaded replay can't keep up → remote_apply stalls."
+    hdr "SCENARIO 1: Index-heavy batch UPDATE saturation"
+    echo "  Strategy: 16 clients UPDATE 25 rows per commit with 15 indexes."
+    echo "  Each commit → 375 index modifications replayed serially."
+    echo "  Primary executes in parallel; standby replays single-threaded."
     echo ""
 
     set_sync_mode "local"
@@ -216,10 +217,10 @@ scenario1() {
         $PSQL -c "CHECKPOINT;" >/dev/null
         sleep 2
 
-        log "Running pgbench (32 clients, 45s)..."
+        log "Running pgbench (16 clients, 45s)..."
         $PGBENCH \
             -f $SQL_DIR/scenario1_saturate_indexes/workload.sql \
-            -c 32 -j 8 -T 45 -P 5 --progress-timestamp 2>&1 \
+            -c 16 -j 8 -T 45 -P 5 --progress-timestamp 2>&1 \
             | tee "$RESULTS_DIR/s1_${MODE}.log"
 
         show_repl
@@ -309,8 +310,10 @@ scenario2() {
 # ══════════════════════════════════════════════════════════════════════════════
 scenario3() {
     hdr "SCENARIO 3: GIN + TOAST bursty replay"
-    echo "  Strategy: 70% INSERT / 30% UPDATE with large TOAST bodies"
-    echo "  and 4 GIN indexes (gin_pending_list_limit=64)."
+    echo "  Strategy: 70% INSERT / 30% UPDATE, 8 rows per commit,"
+    echo "  with large TOAST bodies and 4 GIN indexes (gin_pending_list_limit=64)."
+    echo "  GIN pending-list flushes are CPU-intensive (posting tree traversal,"
+    echo "  compression) — faster NVMe doesn't help, replay is CPU-bound."
     echo ""
 
     set_sync_mode "local"
@@ -479,7 +482,8 @@ scenario6() {
     echo "  Strategy: checkpoint_timeout=30s + random scattered UPDATEs."
     echo "  After each checkpoint, every page touch generates 8KB FPI."
     echo ""
-    echo "  SCALE: effect grows directly with shared_buffers size."
+    echo "  NOTE: effect scales directly with shared_buffers size."
+    echo "  On this server, shared_buffers may be small → marginal result."
     echo "  At shared_buffers=75 GB (typical on a 300 GiB server), a checkpoint"
     echo "  FPI storm can generate 10-75 GB of WAL in seconds. Replay at 300 MB/s"
     echo "  takes 30-250 seconds — all remote_apply commits stall for the duration."
@@ -1085,19 +1089,14 @@ scenario13() {
 scenario14() {
     hdr "SCENARIO 14: Replay throughput saturation — single-threaded replay ceiling"
     echo "  Mechanism: WAL replay is single-threaded (one startup process)."
+    echo "  Each 5-row UPDATE modifies 4 indexes → 20 index mods per commit."
+    echo ""
     echo "  remote_write: primary waits only for WAL bytes to reach standby memory."
     echo "  remote_apply: every commit competes for the same single replay thread."
     echo ""
-    echo "  As concurrency rises, WAL generation rate climbs. Once it approaches"
-    echo "  replay throughput, commits queue behind the replay process."
-    echo "  remote_apply latency grows with concurrency; remote_write stays flat."
-    echo "  This is the hard ceiling remote_apply hits that remote_write does not:"
-    echo "  replay is the bottleneck, not the network."
-    echo ""
-    echo "  SCALE: a 128-CPU server can generate 1+ GB/s of WAL at peak TPS."
-    echo "  NVMe replay throughput is ~200-500 MB/s — saturation is guaranteed"
-    echo "  at high concurrency. On a small VM this scenario shows the trend;"
-    echo "  the full effect requires a many-CPU server to actually saturate replay."
+    echo "  At low concurrency replay keeps up. As concurrency rises, WAL generation"
+    echo "  approaches replay throughput → commits queue behind the startup process"
+    echo "  → added latency climbs. This is the hard ceiling remote_apply hits."
     echo ""
 
     set_sync_mode "local"
@@ -1106,7 +1105,7 @@ scenario14() {
     set_sync_mode "remote_write"
     wait_for_catchup 60
 
-    local -a LEVELS=(1 2 4 8 16 32)
+    local -a LEVELS=(1 2 4 8 16 32 64 128)
 
     for MODE in remote_write remote_apply; do
         log "── $MODE ──"
@@ -1114,7 +1113,7 @@ scenario14() {
 
         for CLIENTS in "${LEVELS[@]}"; do
             local THREADS
-            THREADS=$(( CLIENTS < 4 ? CLIENTS : 4 ))
+            THREADS=$(( CLIENTS < 8 ? CLIENTS : 8 ))
             log "pgbench concurrency=$CLIENTS clients (20s)..."
             $PGBENCH \
                 -f "$SQL_DIR/scenario14_replay_saturation/workload.sql" \
@@ -1126,7 +1125,7 @@ scenario14() {
         done
 
         # Canonical log for report.sh = highest-concurrency run
-        cp "$RESULTS_DIR/s14_${MODE}_c32.log" "$RESULTS_DIR/s14_${MODE}.log"
+        cp "$RESULTS_DIR/s14_${MODE}_c128.log" "$RESULTS_DIR/s14_${MODE}.log"
     done
 
     hdr "SCENARIO 14 — RESULTS (avg latency ms vs concurrency)"
@@ -1152,7 +1151,7 @@ scenario14() {
     echo ""
     echo "  Growing added_ms with client count = replay saturation onset."
     echo "  Flat added_ms = replay keeps up; all overhead is network RTT."
-    echo "  On a 128-CPU/NVMe server the divergence point is 100s+ ms added."
+    echo "  5 rows × 4 indexes per commit = 20 index mods → heavier replay."
     echo ""
 }
 
@@ -1261,7 +1260,7 @@ main() {
 
     local scenarios=("${@}")
     if [ ${#scenarios[@]} -eq 0 ]; then
-        scenarios=(1 2 3 4 5 6 7 8 9 10 11 12 13 14 15)
+        scenarios=(1 2 3 4 6 7 8 10 11 12 14 15)
     fi
 
     for s in "${scenarios[@]}"; do

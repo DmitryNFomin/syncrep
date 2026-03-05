@@ -40,12 +40,12 @@ fi
 # ── scenario metadata ─────────────────────────────────────────────────────────
 scenario_name() {
     case "$1" in
-        1)   echo "Index-heavy UPDATE saturation" ;;
+        1)   echo "Index-heavy batch UPDATE (25 rows)" ;;
         2)   echo "Blocked replay (snapshot conflict)" ;;
-        3)   echo "GIN + TOAST bursty replay" ;;
+        3)   echo "GIN + TOAST batch (8 rows)" ;;
         4)   echo "Schema migration (CREATE INDEX)" ;;
         5)   echo "Bulk INSERT / ETL" ;;
-        6)   echo "FPI storm (frequent checkpoints)" ;;
+        6)   echo "FPI storm (HW-scale dependent)" ;;
         7)   echo "Reporting query (cross-table blast)" ;;
         8)   echo "Table rewrite / lock conflict" ;;
         9)   echo "Buffer pin (VACUUM FREEZE)" ;;
@@ -54,7 +54,7 @@ scenario_name() {
         11)  echo "DROP 50-partition table (wall clock)" ;;
         12)  echo "VACUUM FULL + logical slot (wall clock)" ;;
         13)  echo "Hash VACUUM (snapshot + cleanup lock)" ;;
-        14)  echo "Replay throughput saturation (32 clients)" ;;
+        14)  echo "Replay saturation (5-row × 4 idx)" ;;
         15)  echo "Anti-wraparound VACUUM FREEZE (wall clock)" ;;
         *)   echo "Unknown scenario $1" ;;
     esac
@@ -152,7 +152,7 @@ main() {
 
     local -a missing_list=()  # human-readable list of unavailable scenario IDs
 
-    for N in 1 2 3 4 5 6 7 8 9 13 14; do
+    for N in 1 2 3 4 6 7 8 14; do
         local rw_f="${RESULTS_DIR}/s${N}_remote_write.log"
         local ra_f="${RESULTS_DIR}/s${N}_remote_apply.log"
         local name
