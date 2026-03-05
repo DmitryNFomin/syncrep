@@ -70,7 +70,7 @@ millisecond of replay adds directly to commit latency.
 | S7 Cross-table blast | Replay stall (snapshot) | **BLOCKED** (0 TPS for 60-80s) | Yes |
 | S8 VACUUM FULL lock | Replay stall (lock) | **BLOCKED** (0 TPS for 60-80s) | **No** |
 | S10 Large UPDATE | WAL replay throughput | ~350 ms | **No** |
-| S12 Logical rewrite | pg_fsync per rewrite record | +300 ms (NVMe) to seconds (Cinder) | **No** |
+| S12 Logical rewrite | pg_fsync per rewrite record | +336 ms (300K rows); scales with rows × fsync latency | **No** |
 | S11 DROP partitions | unlink() per file on replay | scales with N parts | **No** |
 | S14 Replay saturation | WAL gen > single-thread replay | grows with concurrency | **No** |
 | S4 CREATE INDEX | Index build on replay | ~17 ms | **No** |
@@ -109,6 +109,12 @@ These scenarios remain in the repo and can be run explicitly:
 ---
 
 ## Prerequisites
+
+**Test environment storage**: The results in this document were collected on
+servers using **Pure Storage** network-attached volumes — not local NVMe.
+Scenarios sensitive to fsync latency (S11, S12) may show different results on
+local disks vs network-attached storage. See individual scenario sections for
+details.
 
 - Two PostgreSQL servers (primary + synchronous standby) managed by Patroni
 - `synchronous_mode: true` in Patroni config (or `synchronous_standby_names`
@@ -525,22 +531,27 @@ replay of one commit.
 Both modes generate the same WAL; the difference is entirely the standby
 spending time calling `pg_fsync()` on mapping files.
 
-**Typical result**: +200–400 ms on local NVMe; **much higher on network storage**
+**Typical result**: +200–400 ms with 300K rows; scales linearly with row count
 
-**fsync latency matters**: The overhead is `N_fsyncs × fsync_latency`. On a
-local datacenter NVMe, each fsync completes in ~1 ms, so 300 fsyncs ≈ 300 ms.
-But fsync latency varies widely by storage backend:
+**fsync latency matters**: The overhead is `N_fsyncs × fsync_latency`.
+The benchmark results above were measured on **Pure Storage network-attached
+volumes** (not local NVMe). On this storage, each fsync averages ~1 ms —
+comparable to local NVMe under normal conditions. However, network-attached
+storage fsync latency is inherently less predictable: while the median may be
+~1 ms, tail latencies of 5–40 ms occur under load or during storage-side
+garbage collection. A single unlucky fsync burst can inflate the overhead
+well beyond the average.
 
-| Storage | Typical fsync | 300 fsyncs | 100K fsyncs (100M rows) |
-|---------|---------------|------------|-------------------------|
+| Storage | Typical fsync | 300 fsyncs (300K rows) | 100K fsyncs (100M rows) |
+|---------|---------------|------------------------|-------------------------|
 | Local NVMe | ~1 ms | ~300 ms | ~100 s |
-| Cinder / network-attached SSD | 5–40 ms | 1.5–12 s | **8 min – 1 h** |
+| Pure Storage (our test env) | ~1 ms median, 5–40 ms tail | ~300 ms – 2 s | **2–20 min** |
+| OpenStack Cinder | 5–40 ms | 1.5–12 s | **8 min – 1 h** |
 | Cloud EBS gp3 | 2–10 ms | 0.6–3 s | **3–17 min** |
 
-On OpenStack Cinder volumes (common in enterprise deployments), fsync latency
-is inherently less predictable because each fsync traverses the network to the
-storage backend. Tail latencies of 20–40 ms are common, making the effect
-significantly more visible than on local disks.
+With network-attached storage, the effect becomes dramatically worse at
+production table sizes because tail latencies compound over thousands of
+sequential fsyncs.
 
 **Scale**: 100 M-row table → ~100,000 fsyncs per VACUUM FULL replay —
 minutes to hours of stall depending on storage fsync latency.
