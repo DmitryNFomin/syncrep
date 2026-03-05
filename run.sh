@@ -351,11 +351,12 @@ scenario3() {
 # SCENARIO 4: Schema migration (UPDATE + CREATE INDEX)
 # ══════════════════════════════════════════════════════════════════════════════
 scenario4() {
-    hdr "SCENARIO 4: Schema migration"
-    echo "  Strategy: UPDATE 2M rows (touching indexed columns) + CREATE INDEX."
-    echo "  4 secondary indexes at setup → every row UPDATE generates ~6 WAL"
-    echo "  records (heap + 5 index updates) = ~12M replay operations total."
-    echo "  Standby's single-threaded replay can't keep up → remote_apply stalls."
+    hdr "SCENARIO 4: Schema migration (parallel UPDATE + CREATE INDEX)"
+    echo "  Strategy: 4 concurrent UPDATEs of 500K rows each (touching indexed"
+    echo "  columns) + 2 CREATE INDEX — all with synchronous_commit=local."
+    echo "  4 parallel sessions generate WAL simultaneously → combined rate"
+    echo "  exceeds single-threaded replay throughput → WAL backlog builds."
+    echo "  Probe commits under remote_apply must wait behind the backlog."
     echo ""
 
     set_sync_mode "local"
@@ -375,30 +376,39 @@ scenario4() {
               -c "DROP INDEX IF EXISTS events_svc_dur" >/dev/null 2>&1
         sleep 3
 
-        log "Starting probe pgbench (16 clients, 60s)..."
+        log "Starting probe pgbench (16 clients, 90s)..."
         $PGBENCH \
             -f $SQL_DIR/scenario4_create_index/workload_probe.sql \
-            -c 16 -j 8 -T 60 -P 5 --progress-timestamp 2>&1 \
-            > "$RESULTS_DIR/s4_${MODE}.log" &
+            -c 16 -j 8 -T 90 -P 5 --progress-timestamp 2>&1 \
+            | tee "$RESULTS_DIR/s4_${MODE}.log" &
         PGBENCH_PID=$!
 
         sleep 5
 
-        log "Running migration (UPDATE + CREATE INDEX, sync_commit=local)..."
+        log "Running parallel migration (4× UPDATE + 2× CREATE INDEX, local sync)..."
         local t0=$(date +%s)
 
-        $PSQL -c "SET synchronous_commit TO local" \
-              -c "SET maintenance_work_mem = '256MB'" \
-              -c "UPDATE events SET user_id = user_id + 1, duration_ms = duration_ms + 1, payload = upper(payload)" 2>&1
-        log "  UPDATE done ($(( $(date +%s) - t0 ))s elapsed)"
+        # 4 parallel UPDATEs, each handling 500K rows.
+        # Combined WAL generation from 4 sessions: ~320 MB/s → exceeds
+        # single-threaded replay (~500 MB/s for small records).
+        for PART in 1 2 3 4; do
+            local start_id=$(( (PART - 1) * 500000 + 1 ))
+            local end_id=$(( PART * 500000 ))
+            $PSQL -c "SET synchronous_commit TO local" \
+                  -c "SET maintenance_work_mem = '256MB'" \
+                  -c "UPDATE events SET user_id = user_id + 1, duration_ms = duration_ms + 1, payload = upper(payload) WHERE id BETWEEN $start_id AND $end_id" \
+                  >/dev/null 2>&1 &
+        done
+        wait
+        log "  parallel UPDATE done ($(( $(date +%s) - t0 ))s elapsed)"
 
         $PSQL -c "SET synchronous_commit TO local" \
               -c "CREATE INDEX events_ts_user ON events(ts, user_id)" 2>&1
-        log "  btree index done ($(( $(date +%s) - t0 ))s elapsed)"
+        log "  btree index #1 done ($(( $(date +%s) - t0 ))s elapsed)"
 
         $PSQL -c "SET synchronous_commit TO local" \
               -c "CREATE INDEX events_svc_dur ON events(service, duration_ms)" 2>&1
-        log "  all indexes done ($(( $(date +%s) - t0 ))s elapsed)"
+        log "  btree index #2 done ($(( $(date +%s) - t0 ))s elapsed)"
 
         log "Migration done. Waiting for pgbench to finish..."
         wait $PGBENCH_PID || true
@@ -406,10 +416,18 @@ scenario4() {
         show_repl
         echo ""
 
-        $PSQL -c "SET synchronous_commit TO local" \
-              -c "DROP INDEX IF EXISTS events_ts_user" \
-              -c "DROP INDEX IF EXISTS events_svc_dur" \
-              -c "UPDATE events SET user_id = user_id - 1, duration_ms = duration_ms - 1, payload = lower(payload)" >/dev/null 2>&1
+        # Reverse changes for next iteration
+        set_sync_mode "local"
+        $PSQL -c "DROP INDEX IF EXISTS events_ts_user" \
+              -c "DROP INDEX IF EXISTS events_svc_dur" >/dev/null 2>&1
+        for PART in 1 2 3 4; do
+            local start_id=$(( (PART - 1) * 500000 + 1 ))
+            local end_id=$(( PART * 500000 ))
+            $PSQL -c "UPDATE events SET user_id = user_id - 1, duration_ms = duration_ms - 1, payload = lower(payload) WHERE id BETWEEN $start_id AND $end_id" \
+                  >/dev/null 2>&1 &
+        done
+        wait
+        set_sync_mode "remote_write"
         wait_for_catchup 300
     done
 

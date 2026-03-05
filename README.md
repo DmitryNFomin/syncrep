@@ -333,29 +333,31 @@ WAL causes small latency spikes when GIN flushes its pending list.
 
 ---
 
-### S4 — Schema migration (UPDATE + CREATE INDEX)
+### S4 — Schema migration (parallel UPDATE + CREATE INDEX)
 
 ```bash
-bash run.sh 4   # ~8 min
+bash run.sh 4   # ~10 min
 ```
 
 **Setup**: `events` table (2 M rows) with 4 secondary B-tree indexes on
 `(user_id, ts)`, `(duration_ms)`, `(service, ts)`, `(user_id, duration_ms)`.
 A probe table (`probe_s4`) takes the latency measurement.
 
-**What it does**: While a pgbench probe runs (16 clients, 60 s), a migration
-UPDATEs all 2 M rows (touching indexed columns `user_id` and `duration_ms`)
-then creates 2 more indexes. The UPDATE forces non-HOT updates (changing
-indexed columns makes it all-or-nothing), so every row generates ~6 WAL
-records (heap + 5 index updates) = ~12 M replay operations.
+**What it does**: While a pgbench probe runs (16 clients, 90 s), 4 parallel
+UPDATE sessions each handle 500 K rows (touching indexed columns `user_id`
+and `duration_ms`), then 2 indexes are created. The UPDATEs force non-HOT
+updates (changing indexed columns = all-or-nothing), so every row generates
+~6 WAL records (heap + 5 index updates).
 
-**Why latency increases**: Single-threaded replay must process 12 M WAL records
-serially. Each record requires a buffer lookup + lock + apply. On fast hardware
-this still takes tens of seconds, during which all `remote_apply` probe commits
-must wait for the replay to reach their position in the WAL stream.
+**Why latency increases**: 4 concurrent UPDATE sessions generate WAL
+simultaneously from 4 CPU cores, but replay is single-threaded. Combined WAL
+rate from 4 sessions exceeds single-threaded replay throughput → a WAL backlog
+builds. Probe commits under `remote_apply` must wait behind this growing
+backlog. A single UPDATE session doesn't saturate replay on fast hardware;
+parallelism is the key.
 
-**What to look for**: Sustained latency elevation during the UPDATE phase
-(visible in progress lines), then a second bump during index creation.
+**What to look for**: Sustained latency elevation during the parallel UPDATE
+phase (visible in progress lines), then a second bump during index creation.
 
 **Typical result**: +10–30 ms during migration
 
