@@ -69,7 +69,6 @@ millisecond of replay adds directly to commit latency.
 | S2 Snapshot conflict | Replay stall (snapshot) | **BLOCKED** (0 TPS for 60-80s) | Yes |
 | S7 Cross-table blast | Replay stall (snapshot) | **BLOCKED** (0 TPS for 60-80s) | Yes |
 | S8 VACUUM FULL lock | Replay stall (lock) | **BLOCKED** (0 TPS for 60-80s) | **No** |
-| S9 Buffer pin | Replay stall (buffer pin) | +10–30 ms | **No** |
 | S10 Large UPDATE | WAL replay throughput | ~350 ms | **No** |
 | S12 Logical rewrite | pg_fsync per rewrite record | scales with rows | **No** |
 | S11 DROP partitions | unlink() per file on replay | scales with N parts | **No** |
@@ -84,7 +83,7 @@ this via pgbench progress lines and reports `BLOCKED — 0 TPS for Xs` instead
 of misleading average latency.
 
 **Key insight**: `hot_standby_feedback = on` prevents only snapshot conflicts
-(S2, S7). Lock conflicts (S8), buffer-pin stalls (S9), and all
+(S2, S7). Lock conflicts (S8) and all
 non-conflict replay overhead (S4, S10–S12, S14) are unaffected — because
 they have nothing to do with row visibility. See [Effect of
 `hot_standby_feedback`](#effect-of-hot_standby_feedback) for the full
@@ -154,7 +153,7 @@ manually:
 
 ```sql
 -- Wait forever on conflicts instead of cancelling standby queries.
--- Required for conflict scenarios (S2, S7, S8, S9) to be meaningful.
+-- Required for conflict scenarios (S2, S7, S8) to be meaningful.
 ALTER SYSTEM SET max_standby_streaming_delay = '-1';
 
 -- Prevent the standby from suppressing VACUUM on the primary.
@@ -221,7 +220,7 @@ remote_write`, once under `remote_apply` — and prints the difference.
 All tables are created automatically; no manual setup is needed.
 
 **Default scenarios** (run by `bash run.sh` with no arguments):
-S1, S2, S3, S4, S7, S8, S9, S10, S11, S12, S14
+S1, S2, S3, S4, S7, S8, S10, S11, S12, S14
 
 **Run all scenarios** (~90 min total):
 ```bash
@@ -427,40 +426,6 @@ BLOCKED — remote_apply: 0 TPS for 60s out of 70s (170x TPS drop)
 
 ---
 
-### S9 — Buffer pin livelock BLOCKS VACUUM FREEZE replay
-
-```bash
-bash run.sh 9   # ~7 min
-```
-
-**Setup**: `freeze_test` table (100 wide rows, ~20 pages — 3 wide text
-columns of ~500 chars each). A probe table (`probe_s9`) takes the latency
-measurement. The tiny table is key: 80 scanners / 20 pages = 4 expected
-pins per page.
-
-**What it does**:
-1. Starts 80 parallel full-table scans on the standby.
-2. Runs a VACUUM FREEZE loop on the primary (12 iterations, local sync).
-3. Simultaneously probes primary commit latency (45 s).
-
-**Mechanism**: `XLOG_HEAP2_FREEZE_PAGE` replay calls `LockBufferForCleanup()`,
-which requires `pin_count = 1`. With 80 concurrent scanners on ~20 pages,
-expected pins per page = 4. Zero-pin windows last only ~0.5 μs — far shorter
-than the ~5 μs the startup process needs to wake and acquire the cleanup lock.
-Result: true **livelock**. Replay is completely blocked for the scan duration.
-
-**Character**: This is a **BLOCKING** scenario like S2/S7/S8, but with a
-fundamentally different trigger: no long-running queries, no old snapshots —
-just normal sequential scan traffic on the standby. The critical tuning
-parameter is the scanners-to-pages ratio, not the total table size.
-
-**What to look for**: 0 TPS in `remote_apply` progress lines while scanners
-are active. `replay_lag` grows continuously during the stall.
-
-**Typical result**: BLOCKED — 0 TPS for 45+ seconds
-
----
-
 ### S10 — Large synchronous UPDATE
 
 ```bash
@@ -646,6 +611,23 @@ preceding VACUUM WAL to be replayed.
 Every `remote_apply` commit issued during that window waits. This is a
 recurring, automatic, unavoidable event on long-lived large tables.
 
+### S9 — Buffer pin contention (VACUUM FREEZE)
+
+```bash
+bash run.sh 9   # ~7 min
+```
+
+**Why not in defaults**: `XLOG_HEAP2_FREEZE_PAGE` replay uses
+`XLogReadBufferForRedo()` (regular exclusive content lock), **not**
+`LockBufferForCleanup()`. Buffer pins from concurrent scanners do not
+block it. Only `HEAP2_PRUNE` and `BTREE_VACUUM` records need cleanup
+locks, but `hot_standby_feedback = on` typically prevents their generation
+(standby xmins prevent dead-tuple removal on the primary).
+
+Buffer pin conflicts are real in production (visible in
+`pg_stat_database_conflicts.confl_bufferpin`), but they require specific
+WAL record types that are hard to generate reliably in a benchmark.
+
 ### S5 — Bulk INSERT / ETL load
 
 ```bash
@@ -691,7 +673,6 @@ for reliable demonstration. Typical result: +1–5 ms.
 | S2 Snapshot conflict | snapshot | BLOCKED | **prevented** |
 | S7 Cross-table blast | snapshot | BLOCKED | **prevented** |
 | S8 VACUUM FULL | lock conflict | BLOCKED | **no effect** |
-| S9 Buffer pin | buffer pin | +10–30 ms | **no effect** |
 | S12 Logical rewrite fsyncs | I/O overhead | adds ms | **no effect** |
 | S10 Large UPDATE | replay throughput | adds ms | **no effect** |
 | S11 DROP partitions | fs ops on replay | adds ms | **no effect** |
@@ -710,9 +691,9 @@ tuple accumulation and table bloat on the primary. This is the fundamental
 tradeoff: use `hsf=on` to protect against snapshot-conflict stalls; accept
 bloat risk.
 
-Lock conflicts (S8), buffer-pin conflicts (S9), and all non-conflict replay
-overhead (S10–S12, S14) are unaffected regardless of this setting.
-(*S15 is a non-default scenario — requires 100 GB+ tables to see the effect.)
+Lock conflicts (S8) and all non-conflict replay overhead (S10–S12, S14)
+are unaffected regardless of this setting.
+(*S9 and S15 are non-default scenarios — see their entries for details.)
 
 ---
 
@@ -726,7 +707,7 @@ overhead (S10–S12, S14) are unaffected regardless of this setting.
      8  Table rewrite / lock conflict           BLOCKED ← 0 TPS for 60/70s (170x TPS drop)
      1  Index-heavy scattered UPDATE (100 rows)  110.2     149.6    +39.4
      3  GIN + TOAST batch (30 rows scattered)   108.4     119.7    +11.3
-     9  Buffer pin (VACUUM FREEZE)              107.6     128.2    +20.6
+     4  Schema migration (time-weighted)          1.0     148.1   +147.1
 ```
 
 - **BLOCKED**: `remote_apply` commits completely frozen (0 TPS) for the

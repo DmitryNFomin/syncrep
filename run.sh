@@ -774,6 +774,11 @@ EOSQL
 # ══════════════════════════════════════════════════════════════════════════════
 # SCENARIO 9: Buffer pin contention during VACUUM FREEZE replay
 # ══════════════════════════════════════════════════════════════════════════════
+# NOT IN DEFAULTS: FREEZE_PAGE replay uses XLogReadBufferForRedo (regular
+# exclusive lock), NOT LockBufferForCleanup. Buffer pins from concurrent
+# scanners do not block it. Only HEAP2_PRUNE and BTREE_VACUUM records need
+# cleanup locks, but hot_standby_feedback prevents their generation.
+# Run manually:  bash run.sh 9
 scenario9() {
     hdr "SCENARIO 9: Buffer pin contention BLOCKS VACUUM FREEZE replay"
     echo "  Mechanism: XLOG_HEAP2_FREEZE_PAGE replay calls"
@@ -1243,7 +1248,7 @@ scenario14() {
 # ══════════════════════════════════════════════════════════════════════════════
 # SCENARIO 15: Anti-wraparound VACUUM — large WAL volume, zero conflicts
 # ══════════════════════════════════════════════════════════════════════════════
-# NOT IN DEFAULTS: VACUUM FREEZE on a 5M-row table generates WAL at ~40 MB/s,
+# NOT IN DEFAULTS: VACUUM FREEZE WAL rate (~40 MB/s) < replay throughput (~500 MB/s).
 # but single-threaded replay handles 500+ MB/s on modern hardware.  The effect
 # only manifests with very large tables (100 GB+) where the sheer WAL volume
 # exceeds replay throughput.  Run manually:  bash run.sh 15
@@ -1345,7 +1350,7 @@ main() {
 
     local scenarios=("${@}")
     if [ ${#scenarios[@]} -eq 0 ]; then
-        scenarios=(1 2 3 4 7 8 9 10 11 12 14)
+        scenarios=(1 2 3 4 7 8 10 11 12 14)
     fi
 
     for s in "${scenarios[@]}"; do
