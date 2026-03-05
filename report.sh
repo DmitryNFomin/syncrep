@@ -40,7 +40,7 @@ fi
 # ── scenario metadata ─────────────────────────────────────────────────────────
 scenario_name() {
     case "$1" in
-        1)   echo "Index-heavy batch UPDATE (25 rows)" ;;
+        1)   echo "Index-heavy scattered UPDATE (50 rows)" ;;
         2)   echo "Blocked replay (snapshot conflict)" ;;
         3)   echo "GIN + TOAST batch (8 rows)" ;;
         4)   echo "Schema migration (CREATE INDEX)" ;;

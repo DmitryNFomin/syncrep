@@ -200,9 +200,10 @@ print_blocking_comparison() {
 # ══════════════════════════════════════════════════════════════════════════════
 scenario1() {
     hdr "SCENARIO 1: Index-heavy batch UPDATE saturation"
-    echo "  Strategy: 16 clients UPDATE 25 rows per commit with 15 indexes."
-    echo "  Each commit → 375 index modifications replayed serially."
-    echo "  Primary executes in parallel; standby replays single-threaded."
+    echo "  Strategy: 16 clients UPDATE 50 SCATTERED rows per commit, 15 indexes."
+    echo "  Scattered = each row on a different heap page + different index leaf pages."
+    echo "  Each commit → ~800 distinct page modifications replayed serially."
+    echo "  Contiguous rows share pages (fast). Scattered rows = random I/O (slow)."
     echo ""
 
     set_sync_mode "local"

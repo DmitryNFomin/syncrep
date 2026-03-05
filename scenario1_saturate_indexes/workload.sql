@@ -1,28 +1,28 @@
--- pgbench custom script: batch UPDATE on the heavily-indexed table.
+-- pgbench custom script: scattered batch UPDATE on the heavily-indexed table.
 --
--- Each execution updates 25 rows, modifying 6 indexed columns per row.
--- With 15 secondary indexes, this generates ~375 index modifications per
--- commit (25 rows × 15 indexes). The primary executes this in parallel
--- across backends; the standby replays ALL 375 index updates serially
--- through the single startup process.
+-- Each execution updates 50 rows SCATTERED across the full 2M-row table.
+-- Unlike contiguous BETWEEN range (which shares 2-3 heap pages), scattered
+-- rows each land on a DIFFERENT heap page and different index leaf pages.
 --
--- 375 index mods × ~27μs each ≈ 10ms of replay overhead per commit.
+-- 50 scattered rows × 15 indexes = 750 distinct index page modifications.
+-- Plus ~50 distinct heap page modifications. Total: ~800 page writes.
+-- Each page write during replay requires a buffer lookup + apply.
+-- Replay must process all 800 page modifications serially.
+--
+-- Contiguous range: 25 rows share 3 pages → ~45 page mods → ~0.2ms replay
+-- Scattered random:  50 rows on 50 pages → ~800 page mods → ~10-15ms replay
 
-\set start random(1, 1999975)
-\set v1 random(1, 1000000)
-\set v2 random(1, 1000000)
-\set v3 random(1, 1000000)
-\set v4 random(1, 1000000)
-\set v5 random(1, 1000000)
-\set v6 random(1, 1000000)
-\set st random(0, 4)
+\set seed random(1, 40000)
 
 UPDATE idx_heavy
-   SET val1   = :v1,
-       val2   = :v2,
-       val3   = :v3,
-       val4   = :v4,
-       val5   = :v5,
-       val6   = :v6,
-       status = :st
- WHERE id BETWEEN :start AND :start + 24;
+   SET val1   = (random() * 1000000)::int,
+       val2   = (random() * 1000000)::int,
+       val3   = (random() * 1000000)::int,
+       val4   = (random() * 1000000)::int,
+       val5   = (random() * 1000000)::int,
+       val6   = (random() * 1000000)::int,
+       status = (random() * 4)::smallint
+ WHERE id IN (
+    SELECT :seed + (i - 1) * 40000
+    FROM generate_series(1, 50) i
+ );

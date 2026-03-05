@@ -76,7 +76,7 @@ millisecond of replay adds directly to commit latency.
 | S11 DROP partitions | unlink() per file on replay | scales with N parts | **No** |
 | S14 Replay saturation | WAL gen > single-thread replay | grows with concurrency | **No** |
 | S4 CREATE INDEX | Index build on replay | ~17 ms | **No** |
-| S1 Index-heavy batch | Baseline RTT + replay | +10–15 ms | — |
+| S1 Index-heavy scattered | ~800 page mods per commit | +10–15 ms | — |
 | S3 GIN/TOAST batch | CPU-bound GIN replay | +10–15 ms | — |
 
 **Blocking scenarios** (S2, S7, S8): `remote_apply` commits freeze completely
@@ -242,28 +242,31 @@ bash report.sh       # re-run any time; reads whatever result files exist
 
 ---
 
-### S1 — Index-heavy batch UPDATE (25 rows)
+### S1 — Index-heavy scattered UPDATE (50 rows × 15 indexes)
 
 ```bash
 bash run.sh 1   # ~3 min
 ```
 
-**Setup**: 2 M-row table with 6 B-tree indexes, fillfactor 50.
+**Setup**: 2 M-row table with 15 B-tree indexes (8 per-column, 4 composite,
+3 functional), fillfactor 50.
 
-**What it does**: Each pgbench transaction updates 25 contiguous rows, touching
-all 6 indexes. Runs 60 s at 16 clients under each sync mode. No standby
-blockers — this is the clean baseline for batch DML.
+**What it does**: Each pgbench transaction updates 50 rows **scattered** across
+the full table (spaced ~40,000 apart). Unlike contiguous `BETWEEN` ranges
+where 25 rows share 2-3 heap pages, scattered rows each land on a different
+heap page and different index leaf pages. Runs 45 s at 16 clients.
 
-**Why latency increases**: 25 rows × 6 indexes = 150 index modifications per
-commit. At ~27 μs replay per index modification, that's ~4 ms of replay work
-per commit. Under `remote_apply` each commit waits for this replay plus
-network RTT.
+**Why latency increases**: 50 scattered rows × 15 indexes ≈ 800 distinct page
+modifications per commit. Each page modification during replay requires a
+buffer lookup and apply. Contiguous rows share pages (fast); scattered rows
+force random buffer access (slow). The replay overhead per commit is
+proportional to the number of *distinct pages* modified, not just row count.
 
 **What to look for**:
 ```
 avg latency (ms)       remote_write   remote_apply
-                            110.2          122.5
-Added latency: +12.3 ms
+                             2.1            14.5
+Added latency: +12.4 ms
 ```
 The per-5 s progress lines should stay stable — no spikes.
 
