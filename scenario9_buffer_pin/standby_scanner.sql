@@ -1,12 +1,15 @@
--- pgbench script for STANDBY: continuous full-table sequential scan.
+-- pgbench script for STANDBY: expensive full-table sequential scan.
 --
--- Each execution reads all ~6800 pages of freeze_test, briefly pinning each
--- buffer as it reads the tuples on that page.  Run many parallel copies
--- (-c 20 in run.sh) to create sustained aggregate pin pressure across the
--- entire table.
+-- Each execution reads all ~1000 pages of freeze_test, briefly pinning each
+-- buffer as it reads and processes the tuples on that page.
 --
--- The goal: at any moment during VACUUM FREEZE WAL replay, there is a
--- meaningful probability that the page the startup process wants to freeze
--- is currently pinned by one of these scans.
+-- The expensive per-row computation (length(a) + length(b) + length(c))
+-- forces the backend to decompress/access the full inline text data for each
+-- row, extending the pin hold time per page to ~200μs instead of ~10μs.
+--
+-- Run 80 parallel copies to create sustained pin pressure: at any moment,
+-- P ≈ scanners × pin_duration / scan_cycle_time ≈ 80 × 200μs / 100ms ≈ 16%.
+-- This means ~160 of the ~1000 pages will have a pin collision during
+-- VACUUM FREEZE replay, each costing one scan cycle of wait time.
 
-SELECT count(*) FROM freeze_test;
+SELECT sum(length(a) + length(b) + length(c)) FROM freeze_test;

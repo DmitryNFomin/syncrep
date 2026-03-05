@@ -15,6 +15,11 @@
 -- that ANY given page has a pin at the moment the startup process requests it.
 -- Each such collision costs up to one scan iteration worth of wait time.
 --
+-- TUNING FOR HIGH-SPEC HARDWARE:
+-- Fewer pages (~1000) + many scanners (80) + expensive per-row work = high
+-- collision probability. With P≈16%, ~1000 pages × 0.16 = 160 collisions,
+-- each costing ~200μs of pin hold time → ~32ms total added delay.
+--
 -- The effect is amplified by running a CHECKPOINT before VACUUM FREEZE:
 -- PostgreSQL's full_page_writes means the first modification to each page after
 -- a checkpoint generates an 8 KB Full Page Image (FPI) in WAL instead of a
@@ -32,20 +37,26 @@
 DROP TABLE IF EXISTS freeze_test;
 DROP TABLE IF EXISTS probe_s9;
 
--- Table sized to generate meaningful WAL volume:
--- ~180 bytes/row → ~44 rows/8KB page → 300K rows ≈ 6800 pages ≈ 53 MB heap.
--- CHECKPOINT + VACUUM FREEZE generates ~6800 × 8 KB = ~53 MB of FPI WAL.
+-- Table sized for high collision probability on fast hardware:
+-- ~1600 bytes/row → ~5 rows/8KB page → 5000 rows ≈ 1000 pages.
+-- Fewer pages means scanners cycle through them faster → higher pin density.
+-- Wide inline text columns force per-row computation to hold pins longer.
 -- autovacuum_enabled=false: prevents autovacuum from preempting our manual FREEZE.
 CREATE TABLE freeze_test (
     id   bigint,
-    a    text,        -- 32-char md5
-    b    text,        -- 32-char md5 (updated between freeze cycles to unfreeze)
+    a    text,        -- ~500 chars inline
+    b    text,        -- ~500 chars inline (updated between freeze cycles)
+    c    text,        -- ~500 chars inline (extra width for slower scans)
     ts   timestamptz DEFAULT now()
 ) WITH (autovacuum_enabled = false);
 
 INSERT INTO freeze_test
-SELECT i, md5(i::text), md5((i * 3)::text), now()
-FROM generate_series(1, 300000) i;
+SELECT i,
+       repeat(chr(65 + (i % 26)), 500),
+       repeat(chr(65 + ((i + 7) % 26)), 500),
+       repeat(chr(65 + ((i + 13) % 26)), 500),
+       now()
+FROM generate_series(1, 5000) i;
 
 -- Probe table on which we measure commit latency.
 -- This is deliberately a different table from freeze_test: the buffer pin

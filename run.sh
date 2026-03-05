@@ -696,21 +696,21 @@ scenario9() {
     echo "  ResolveRecoveryConflictWithBufferPin() on each frozen page."
     echo "  With max_standby_streaming_delay=-1, the startup process waits for"
     echo "  ALL pins on that buffer to drop before acquiring the cleanup lock."
-    echo "  Many concurrent full-table scans on the standby create sustained"
-    echo "  pin pressure: each scan briefly pins every page it reads."
+    echo ""
+    echo "  Tuned for high-spec HW: compact table (~1000 pages) + 80 scanners"
+    echo "  doing expensive per-row work (sum(length(a)+length(b)+length(c)))."
+    echo "  Each scanner holds a pin ~200μs per page; with 80 scanners cycling"
+    echo "  through 1000 pages in ~100ms, collision probability P ≈ 16%."
+    echo "  ~160 collisions × ~200μs wait each ≈ 32ms added per VACUUM FREEZE."
     echo ""
     echo "  Unlike scenarios 2/7 (one snapshot blocks all replay for 90s),"
     echo "  this produces many small per-page stalls that aggregate to seconds."
     echo "  Stalls are amplified by CHECKPOINT-induced FPIs (each frozen page"
     echo "  also gets an 8KB full-page image after the preceding CHECKPOINT)."
     echo ""
-    echo "  SCALE: effect grows with table size. More pages = more FREEZE_PAGE"
-    echo "  records + FPIs = more pin collision opportunities per VACUUM FREEZE."
-    echo "  For the pure WAL-volume aspect of anti-wraparound at scale, see S15."
-    echo ""
 
     set_sync_mode "local"
-    log "Loading freeze_test (300K rows, ~60 MB — takes ~15s)..."
+    log "Loading freeze_test (5K wide rows, ~1000 pages — takes ~5s)..."
     $PSQL -f $SQL_DIR/scenario9_buffer_pin/setup.sql >/dev/null 2>&1
     set_sync_mode "remote_write"
     wait_for_catchup 120
@@ -720,7 +720,7 @@ scenario9() {
         set_sync_mode "$MODE"
 
         # CHECKPOINT forces FPIs for all pages on the next VACUUM FREEZE,
-        # amplifying WAL volume (~60 MB of FPIs for a 60 MB table).
+        # amplifying WAL volume (~8 MB of FPIs for a ~8 MB table).
         log "CHECKPOINT to force FPIs on next VACUUM FREEZE..."
         $PSQL -c "CHECKPOINT;" >/dev/null
         sleep 2
@@ -729,16 +729,17 @@ scenario9() {
         # (already-frozen tuples are skipped; we need unfrozen ones).
         log "Updating 1/3 of rows to create unfrozen tuples (local sync)..."
         $PSQL -c "SET synchronous_commit TO local;
-                  UPDATE freeze_test SET b = md5(b) WHERE id % 3 = 0;" >/dev/null
+                  UPDATE freeze_test SET b = repeat(chr(65 + (id % 26)), 500)
+                  WHERE id % 3 = 0;" >/dev/null
 
-        # Start parallel full-table scans on standby to build buffer pin pressure.
-        # Each scan pins each of the ~7500 pages briefly as it reads them.
-        # With 20 concurrent scans the probability that any given page is pinned
-        # at any moment is meaningful; VACUUM FREEZE must wait per collision.
-        log "Starting 20 parallel full-table scans on standby (pin pressure)..."
+        # Start 80 parallel full-table scans on standby to build buffer pin pressure.
+        # Each scan processes ~1000 pages with expensive per-row computation
+        # (sum of length() on 3 wide text columns), holding pins ~200μs per page.
+        # P(collision) ≈ 80 × 200μs / 100ms ≈ 16%.
+        log "Starting 80 parallel full-table scans on standby (pin pressure)..."
         $PGBENCH_S \
             -f $SQL_DIR/scenario9_buffer_pin/standby_scanner.sql \
-            -c 20 -j 4 -T 75 --no-vacuum 2>/dev/null &
+            -c 80 -j 8 -T 75 --no-vacuum 2>/dev/null &
         SCANNER_PID=$!
         sleep 3  # let scanners get going
 
@@ -748,15 +749,16 @@ scenario9() {
         # We cycle UPDATE→VACUUM FREEZE to keep generating work.
         log "Starting VACUUM FREEZE loop (local sync)..."
         (
-            for i in $(seq 1 8); do
+            for i in $(seq 1 12); do
                 $PSQL -c "SET synchronous_commit TO local;
-                          UPDATE freeze_test SET b = md5(b) WHERE id % 5 = 0;" \
+                          UPDATE freeze_test SET b = repeat(chr(65 + (id % 26)), 500)
+                          WHERE id % 5 = 0;" \
                       >/dev/null 2>&1
                 $PSQL -c "SET vacuum_freeze_min_age = 0;
                           SET synchronous_commit TO local;
                           VACUUM FREEZE freeze_test;" \
                       >/dev/null 2>&1
-                sleep 2
+                sleep 1
             done
         ) &
         FREEZE_PID=$!
@@ -1260,7 +1262,7 @@ main() {
 
     local scenarios=("${@}")
     if [ ${#scenarios[@]} -eq 0 ]; then
-        scenarios=(1 2 3 4 6 7 8 10 11 12 14 15)
+        scenarios=(1 2 3 4 6 7 8 9 10 11 12 14 15)
     fi
 
     for s in "${scenarios[@]}"; do
