@@ -70,7 +70,7 @@ millisecond of replay adds directly to commit latency.
 | S7 Cross-table blast | Replay stall (snapshot) | **BLOCKED** (0 TPS for 60-80s) | Yes |
 | S8 VACUUM FULL lock | Replay stall (lock) | **BLOCKED** (0 TPS for 60-80s) | **No** |
 | S10 Large UPDATE | WAL replay throughput | ~350 ms | **No** |
-| S12 Logical rewrite | pg_fsync per rewrite record | scales with rows | **No** |
+| S12 Logical rewrite | pg_fsync per rewrite record | +300 ms (NVMe) to seconds (Cinder) | **No** |
 | S11 DROP partitions | unlink() per file on replay | scales with N parts | **No** |
 | S14 Replay saturation | WAL gen > single-thread replay | grows with concurrency | **No** |
 | S4 CREATE INDEX | Index build on replay | ~17 ms | **No** |
@@ -519,16 +519,31 @@ replay of one commit.
 
 **What to look for**:
 ```
-  remote_write:  1640 ms    WAL generated: 45 MB
-  remote_apply:  1712 ms    WAL generated: 45 MB    (+72 ms)
+  remote_write:  2197 ms
+  remote_apply:  2533 ms    (+336 ms)
 ```
 Both modes generate the same WAL; the difference is entirely the standby
 spending time calling `pg_fsync()` on mapping files.
 
-**Typical result**: +60–100 ms; scales with table size and row count
+**Typical result**: +200–400 ms on local NVMe; **much higher on network storage**
+
+**fsync latency matters**: The overhead is `N_fsyncs × fsync_latency`. On a
+local datacenter NVMe, each fsync completes in ~1 ms, so 300 fsyncs ≈ 300 ms.
+But fsync latency varies widely by storage backend:
+
+| Storage | Typical fsync | 300 fsyncs | 100K fsyncs (100M rows) |
+|---------|---------------|------------|-------------------------|
+| Local NVMe | ~1 ms | ~300 ms | ~100 s |
+| Cinder / network-attached SSD | 5–40 ms | 1.5–12 s | **8 min – 1 h** |
+| Cloud EBS gp3 | 2–10 ms | 0.6–3 s | **3–17 min** |
+
+On OpenStack Cinder volumes (common in enterprise deployments), fsync latency
+is inherently less predictable because each fsync traverses the network to the
+storage backend. Tail latencies of 20–40 ms are common, making the effect
+significantly more visible than on local disks.
 
 **Scale**: 100 M-row table → ~100,000 fsyncs per VACUUM FULL replay —
-seconds to minutes of stall every time the table is vacuumed.
+minutes to hours of stall depending on storage fsync latency.
 
 ---
 
@@ -708,6 +723,7 @@ are unaffected regardless of this setting.
      1  Index-heavy scattered UPDATE (100 rows)  110.2     149.6    +39.4
      3  GIN + TOAST batch (30 rows scattered)   108.4     119.7    +11.3
      4  Schema migration (time-weighted)          1.0     148.1   +147.1
+    12  VACUUM FULL + logical slot              2197      2533     +336
 ```
 
 - **BLOCKED**: `remote_apply` commits completely frozen (0 TPS) for the

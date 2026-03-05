@@ -1383,6 +1383,22 @@ main() {
         local rw_f="$RESULTS_DIR/s${S_NUM}_remote_write.log"
         local ra_f="$RESULTS_DIR/s${S_NUM}_remote_apply.log"
         if [ -f "$rw_f" ] && [ -f "$ra_f" ]; then
+
+            # S12: wall-clock VACUUM FULL time (not pgbench)
+            if [ "$S_NUM" = "12" ]; then
+                local t_rw t_ra
+                t_rw=$(grep 'VACUUM FULL wall time' "$rw_f" | awk '{print $(NF-1)}')
+                t_ra=$(grep 'VACUUM FULL wall time' "$ra_f" | awk '{print $(NF-1)}')
+                if [ -n "$t_rw" ] && [ -n "$t_ra" ]; then
+                    local added ratio
+                    added=$(awk "BEGIN {printf \"%.1f\", $t_ra - $t_rw}")
+                    ratio=$(awk "BEGIN {printf \"%.1f\", $t_ra / $t_rw}")
+                    printf "  S%-3d %14s %14s %+13.1f %7sx\n" \
+                        "$S_NUM" "$t_rw" "$t_ra" "$added" "$ratio"
+                fi
+                continue
+            fi
+
             # Detect blocking: 0-TPS intervals in remote_apply progress
             local zero_int total_int
             read -r zero_int total_int <<< "$(parse_blocking_stats "$ra_f")"
