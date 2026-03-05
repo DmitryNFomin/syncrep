@@ -73,6 +73,19 @@ parse_wall_time() {
     grep "$keyword" "$file" 2>/dev/null | head -1 | awk '{print $(NF-1)}'
 }
 
+parse_blocking_stats() {
+    local file="$1"
+    local zero total
+    zero=$(grep -c ', 0\.0 tps,' "$file" 2>/dev/null || echo 0)
+    total=$(grep -c '^progress:' "$file" 2>/dev/null || echo 0)
+    echo "$zero $total"
+}
+
+parse_pgbench_tps() {
+    local file="$1"
+    grep '^tps' "$file" 2>/dev/null | head -1 | awk -F'= ' '{print $2}' | awk '{print $1}'
+}
+
 # ── arithmetic helpers (awk for floating-point) ───────────────────────────────
 awk_sub()  { awk "BEGIN {printf \"%.1f\", $1 - $2}"; }
 awk_fmt1() { awk "BEGIN {printf \"%.1f\", $1}"; }
@@ -236,6 +249,23 @@ main() {
         local rw_fmt ra_fmt added_fmt
         rw_fmt=$(awk_fmt1 "$rw_v")
         ra_fmt=$(awk_fmt1 "$ra_v")
+
+        # Check for blocking (0-TPS intervals in remote_apply progress)
+        local ra_file="${RESULTS_DIR}/s${sid}_remote_apply.log"
+        local rw_file="${RESULTS_DIR}/s${sid}_remote_write.log"
+        local b_zero b_total
+        read -r b_zero b_total <<< "$(parse_blocking_stats "$ra_file")"
+        if [ "$b_zero" -gt 0 ] 2>/dev/null; then
+            local blocked_s=$(( b_zero * 5 ))
+            local total_s=$(( b_total * 5 ))
+            local tps_rw_v tps_ra_v tps_ratio_v
+            tps_rw_v=$(parse_pgbench_tps "$rw_file")
+            tps_ra_v=$(parse_pgbench_tps "$ra_file")
+            tps_ratio_v=$(awk "BEGIN {printf \"%.0f\", $tps_rw_v / $tps_ra_v}")
+            printf "  %4s  %-36s  %7s  ${C_RED}%8s${C_RESET}  ← 0 TPS for %d/%ds (%sx TPS drop)\n" \
+                "$sid" "$sname" "$rw_fmt" "BLOCKED" "$blocked_s" "$total_s" "$tps_ratio_v"
+            continue
+        fi
 
         if [ "$is_neg" = "1" ]; then
             added_fmt=$(printf "%s" "$added_v")
@@ -439,6 +469,11 @@ main() {
         [ "${pb_missing[$idx]}" = "1" ] && continue
         [ "${pb_negative[$idx]}" = "1" ] && continue
         [ "${pb_added[$idx]}" = "ERR" ] && continue
+        # Skip blocking scenarios — their avg latency is meaningless
+        local chk_file="${RESULTS_DIR}/s${pb_ids[$idx]}_remote_apply.log"
+        local chk_zero
+        chk_zero=$(grep -c ', 0\.0 tps,' "$chk_file" 2>/dev/null || echo 0)
+        [ "$chk_zero" -gt 0 ] && continue
         sum_vals+=("${pb_added[$idx]}")
         sum_ids+=("${pb_ids[$idx]}")
         sum_names+=("${pb_names[$idx]}")

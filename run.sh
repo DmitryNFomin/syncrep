@@ -97,6 +97,19 @@ extract_tps() {
     grep '^tps' "$1" 2>/dev/null | head -1 | awk -F'= ' '{print $2}' | awk '{print $1}'
 }
 
+# Count 0-TPS intervals from pgbench progress output.
+# When remote_apply blocks replay, ALL clients freeze: pgbench reports 0.0 TPS
+# for those intervals. This detects the complete freeze, not just "high latency".
+# Args: $1 = log file (must contain pgbench -P progress lines via 2>&1)
+# Output: "zero_intervals total_intervals"
+parse_blocking_stats() {
+    local file="$1"
+    local zero total
+    zero=$(grep -c ', 0\.0 tps,' "$file" 2>/dev/null || echo 0)
+    total=$(grep -c '^progress:' "$file" 2>/dev/null || echo 0)
+    echo "$zero $total"
+}
+
 kill_standby_sessions() {
     $PSQL_S -tAc "
       SELECT pg_terminate_backend(pid)
@@ -131,6 +144,52 @@ print_comparison() {
             echo -e "  ${GREEN}PASS${NC} — remote_apply latency is measurably higher"
         else
             echo -e "  ${YELLOW}MARGINAL${NC} — delta is small"
+        fi
+    fi
+    echo ""
+}
+
+# Print results for blocking scenarios (S2, S7, S8).
+# These scenarios cause a COMPLETE FREEZE of all commits under remote_apply,
+# not just increased latency. Average latency is misleading because pgbench
+# only counts completed transactions — it hides the 60-80s total outage.
+print_blocking_comparison() {
+    local label="$1" rw_log="$2" ra_log="$3"
+
+    local tps_rw tps_ra
+    tps_rw=$(extract_tps "$rw_log")
+    tps_ra=$(extract_tps "$ra_log")
+
+    # Count 0-TPS intervals from remote_apply progress output (5s intervals)
+    local zero_int total_int
+    read -r zero_int total_int <<< "$(parse_blocking_stats "$ra_log")"
+    local blocked_s=$(( zero_int * 5 ))
+    local total_s=$(( total_int * 5 ))
+
+    hdr "$label — RESULTS"
+    printf "  %-20s %12s %12s\n" ""    "remote_write" "remote_apply"
+    printf "  %-20s %12s %12s\n" "TPS" "$tps_rw"      "$tps_ra"
+    echo ""
+
+    if [ "$zero_int" -gt 0 ]; then
+        echo -e "  ${RED}${BOLD}BLOCKED${NC} — remote_apply: 0 TPS for ${blocked_s}s out of ${total_s}s"
+        echo -e "  All commits were completely frozen while replay was paused."
+        if [ -n "$tps_rw" ] && [ -n "$tps_ra" ]; then
+            local tps_ratio
+            tps_ratio=$(awk "BEGIN {printf \"%.0f\", $tps_rw / $tps_ra}")
+            echo -e "  Effective TPS drop: ${tps_ratio}x"
+        fi
+    else
+        # Fallback: no blocking detected (e.g. progress lines not captured)
+        local lat_rw lat_ra
+        lat_rw=$(extract_avg_latency "$rw_log")
+        lat_ra=$(extract_avg_latency "$ra_log")
+        printf "  %-20s %12s %12s\n" "avg latency (ms)" "$lat_rw" "$lat_ra"
+        if [ -n "$lat_rw" ] && [ -n "$lat_ra" ]; then
+            local added ratio
+            added=$(awk "BEGIN {printf \"%.1f\", $lat_ra - $lat_rw}")
+            ratio=$(awk "BEGIN {printf \"%.1f\", $lat_ra / $lat_rw}")
+            echo -e "  ${BOLD}Added latency: +${added} ms${NC}  (ratio: ${ratio}x)"
         fi
     fi
     echo ""
@@ -241,8 +300,8 @@ scenario2() {
         echo ""
     done
 
-    print_comparison "SCENARIO 2" "$RESULTS_DIR/s2_remote_write.log" \
-                     "$RESULTS_DIR/s2_remote_apply.log" 5.0
+    print_blocking_comparison "SCENARIO 2" "$RESULTS_DIR/s2_remote_write.log" \
+                              "$RESULTS_DIR/s2_remote_apply.log"
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -531,8 +590,8 @@ scenario7() {
         echo ""
     done
 
-    print_comparison "SCENARIO 7" "$RESULTS_DIR/s7_remote_write.log" \
-                     "$RESULTS_DIR/s7_remote_apply.log" 5.0
+    print_blocking_comparison "SCENARIO 7" "$RESULTS_DIR/s7_remote_write.log" \
+                              "$RESULTS_DIR/s7_remote_apply.log"
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -575,7 +634,7 @@ scenario8() {
         $PGBENCH \
             -f $SQL_DIR/scenario8_table_rewrite/workload_probe.sql \
             -c 8 -j 4 -T 45 -P 5 --progress-timestamp 2>&1 \
-            > "$RESULTS_DIR/s8_${MODE}.log" &
+            | tee "$RESULTS_DIR/s8_${MODE}.log" &
         PGBENCH_PID=$!
 
         sleep 2
@@ -620,8 +679,8 @@ EOSQL
         fi
     done
 
-    print_comparison "SCENARIO 8" "$RESULTS_DIR/s8_remote_write.log" \
-                     "$RESULTS_DIR/s8_remote_apply.log" 2.0
+    print_blocking_comparison "SCENARIO 8" "$RESULTS_DIR/s8_remote_write.log" \
+                              "$RESULTS_DIR/s8_remote_apply.log"
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1235,14 +1294,30 @@ main() {
         local rw_f="$RESULTS_DIR/s${S_NUM}_remote_write.log"
         local ra_f="$RESULTS_DIR/s${S_NUM}_remote_apply.log"
         if [ -f "$rw_f" ] && [ -f "$ra_f" ]; then
-            local lat_rw lat_ra added ratio
-            lat_rw=$(extract_avg_latency "$rw_f")
-            lat_ra=$(extract_avg_latency "$ra_f")
-            if [ -n "$lat_rw" ] && [ -n "$lat_ra" ]; then
-                added=$(awk "BEGIN {printf \"%.1f\", $lat_ra - $lat_rw}")
-                ratio=$(awk "BEGIN {printf \"%.1f\", $lat_ra / $lat_rw}")
-                printf "  S%-3d %14s %14s %+13.1f %7sx\n" \
-                    "$S_NUM" "$lat_rw" "$lat_ra" "$added" "$ratio"
+            # Detect blocking: 0-TPS intervals in remote_apply progress
+            local zero_int total_int
+            read -r zero_int total_int <<< "$(parse_blocking_stats "$ra_f")"
+
+            if [ "$zero_int" -gt 0 ] 2>/dev/null; then
+                local blocked_s=$(( zero_int * 5 ))
+                local total_s=$(( total_int * 5 ))
+                local lat_rw tps_rw tps_ra tps_ratio
+                lat_rw=$(extract_avg_latency "$rw_f")
+                tps_rw=$(extract_tps "$rw_f")
+                tps_ra=$(extract_tps "$ra_f")
+                tps_ratio=$(awk "BEGIN {printf \"%.0f\", $tps_rw / $tps_ra}")
+                printf "  S%-3d %14s    ${RED}${BOLD}BLOCKED${NC}  ← 0 TPS for %d/%ds (%sx TPS drop)\n" \
+                    "$S_NUM" "${lat_rw:-?}" "$blocked_s" "$total_s" "$tps_ratio"
+            else
+                local lat_rw lat_ra added ratio
+                lat_rw=$(extract_avg_latency "$rw_f")
+                lat_ra=$(extract_avg_latency "$ra_f")
+                if [ -n "$lat_rw" ] && [ -n "$lat_ra" ]; then
+                    added=$(awk "BEGIN {printf \"%.1f\", $lat_ra - $lat_rw}")
+                    ratio=$(awk "BEGIN {printf \"%.1f\", $lat_ra / $lat_rw}")
+                    printf "  S%-3d %14s %14s %+13.1f %7sx\n" \
+                        "$S_NUM" "$lat_rw" "$lat_ra" "$added" "$ratio"
+                fi
             fi
         fi
     done
