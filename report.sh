@@ -43,7 +43,7 @@ scenario_name() {
         1)   echo "Index-heavy scattered UPDATE (100 rows)" ;;
         2)   echo "Blocked replay (snapshot conflict)" ;;
         3)   echo "GIN + TOAST batch (30 rows scattered)" ;;
-        4)   echo "Schema migration (CREATE INDEX)" ;;
+        4)   echo "Schema migration (time-weighted)" ;;
         5)   echo "Bulk INSERT / ETL" ;;
         6)   echo "FPI storm (HW-scale dependent)" ;;
         7)   echo "Reporting query (cross-table blast)" ;;
@@ -84,6 +84,15 @@ parse_blocking_stats() {
 parse_pgbench_tps() {
     local file="$1"
     grep '^tps' "$file" 2>/dev/null | head -1 | awk -F'= ' '{print $2}' | awk '{print $1}'
+}
+
+# Time-weighted average: mean of per-interval latencies from progress lines.
+# Essential for burst scenarios where transaction-weighted avg hides the spike.
+parse_time_weighted_latency() {
+    local file="$1"
+    grep '^progress:' "$file" 2>/dev/null \
+        | awk -F', ' '{for(i=1;i<=NF;i++) if($i ~ /^lat /) {split($i,a," "); print a[2]}}' \
+        | awk '{s+=$1; n++} END {if(n>0) printf "%.1f", s/n; else print ""}'
 }
 
 # ── arithmetic helpers (awk for floating-point) ───────────────────────────────
@@ -164,8 +173,15 @@ main() {
         fi
 
         local rw ra
-        rw=$(parse_pgbench_latency "$rw_f")
-        ra=$(parse_pgbench_latency "$ra_f")
+        if [ "$N" = "4" ]; then
+            # S4 is a burst scenario: use time-weighted average to avoid
+            # dilution from the calm period after the FPI burst.
+            rw=$(parse_time_weighted_latency "$rw_f")
+            ra=$(parse_time_weighted_latency "$ra_f")
+        else
+            rw=$(parse_pgbench_latency "$rw_f")
+            ra=$(parse_pgbench_latency "$ra_f")
+        fi
 
         if [ -z "$rw" ] || [ -z "$ra" ]; then
             # Files exist but could not be parsed — treat as parse error

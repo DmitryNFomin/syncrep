@@ -93,6 +93,23 @@ extract_avg_latency() {
     grep 'latency average' "$1" 2>/dev/null | head -1 | awk -F'= ' '{print $2}' | awk '{print $1}'
 }
 
+# Time-weighted average latency from pgbench progress lines.
+# Unlike pgbench's "latency average" (transaction-weighted), this treats
+# each 5s interval equally — essential for bursty scenarios where a few
+# seconds at 400ms are drowned by millions of fast transactions.
+extract_time_weighted_latency() {
+    grep '^progress:' "$1" 2>/dev/null \
+        | awk -F', ' '{for(i=1;i<=NF;i++) if($i ~ /^lat /) {split($i,a," "); print a[2]}}' \
+        | awk '{s+=$1; n++} END {if(n>0) printf "%.1f", s/n; else print ""}'
+}
+
+# Peak 5-second-window latency from pgbench progress lines.
+extract_peak_latency() {
+    grep '^progress:' "$1" 2>/dev/null \
+        | awk -F', ' '{for(i=1;i<=NF;i++) if($i ~ /^lat /) {split($i,a," "); print a[2]}}' \
+        | awk 'BEGIN{m=0} {if($1>m) m=$1} END {if(m>0) printf "%.1f", m; else print ""}'
+}
+
 extract_tps() {
     grep '^tps' "$1" 2>/dev/null | head -1 | awk -F'= ' '{print $2}' | awk '{print $1}'
 }
@@ -190,6 +207,45 @@ print_blocking_comparison() {
             added=$(awk "BEGIN {printf \"%.1f\", $lat_ra - $lat_rw}")
             ratio=$(awk "BEGIN {printf \"%.1f\", $lat_ra / $lat_rw}")
             echo -e "  ${BOLD}Added latency: +${added} ms${NC}  (ratio: ${ratio}x)"
+        fi
+    fi
+    echo ""
+}
+
+# Print results for burst scenarios (S4) where a brief heavy WAL phase
+# is followed by calm.  pgbench's transaction-weighted average hides
+# the spike (370 slow txns drowned by 260K fast ones).  Instead report:
+#   - Time-weighted average (mean of per-interval latencies)
+#   - Peak 5s-window latency
+#   - TPS ratio
+print_burst_comparison() {
+    local label="$1" rw_log="$2" ra_log="$3"
+
+    local tw_rw tw_ra pk_rw pk_ra tps_rw tps_ra
+    tw_rw=$(extract_time_weighted_latency "$rw_log")
+    tw_ra=$(extract_time_weighted_latency "$ra_log")
+    pk_rw=$(extract_peak_latency "$rw_log")
+    pk_ra=$(extract_peak_latency "$ra_log")
+    tps_rw=$(extract_tps "$rw_log")
+    tps_ra=$(extract_tps "$ra_log")
+
+    hdr "$label — RESULTS"
+    printf "  %-28s %12s %12s\n" ""                        "remote_write" "remote_apply"
+    printf "  %-28s %12s %12s\n" "time-weighted avg (ms)"  "$tw_rw"       "$tw_ra"
+    printf "  %-28s %12s %12s\n" "peak 5s-window (ms)"     "$pk_rw"       "$pk_ra"
+    printf "  %-28s %12s %12s\n" "TPS"                     "$tps_rw"      "$tps_ra"
+
+    if [ -n "$tw_rw" ] && [ -n "$tw_ra" ]; then
+        local added ratio
+        added=$(awk "BEGIN {printf \"%.1f\", $tw_ra - $tw_rw}")
+        ratio=$(awk "BEGIN {printf \"%.1f\", $tw_ra / $tw_rw}")
+        echo ""
+        echo -e "  ${BOLD}Added latency (time-weighted): +${added} ms${NC}"
+        echo -e "  Latency ratio: ${ratio}x"
+        if [ -n "$pk_rw" ] && [ -n "$pk_ra" ]; then
+            local pk_added
+            pk_added=$(awk "BEGIN {printf \"%.1f\", $pk_ra - $pk_rw}")
+            echo -e "  Peak-window delta: +${pk_added} ms"
         fi
     fi
     echo ""
@@ -437,8 +493,8 @@ scenario4() {
         wait_for_catchup 300
     done
 
-    print_comparison "SCENARIO 4" "$RESULTS_DIR/s4_remote_write.log" \
-                     "$RESULTS_DIR/s4_remote_apply.log" 1.3
+    print_burst_comparison "SCENARIO 4" "$RESULTS_DIR/s4_remote_write.log" \
+                          "$RESULTS_DIR/s4_remote_apply.log"
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1338,8 +1394,14 @@ main() {
                     "$S_NUM" "${lat_rw:-?}" "$blocked_s" "$total_s" "$tps_ratio"
             else
                 local lat_rw lat_ra added ratio
-                lat_rw=$(extract_avg_latency "$rw_f")
-                lat_ra=$(extract_avg_latency "$ra_f")
+                # S4 uses time-weighted avg (burst scenario)
+                if [ "$S_NUM" = "4" ]; then
+                    lat_rw=$(extract_time_weighted_latency "$rw_f")
+                    lat_ra=$(extract_time_weighted_latency "$ra_f")
+                else
+                    lat_rw=$(extract_avg_latency "$rw_f")
+                    lat_ra=$(extract_avg_latency "$ra_f")
+                fi
                 if [ -n "$lat_rw" ] && [ -n "$lat_ra" ]; then
                     added=$(awk "BEGIN {printf \"%.1f\", $lat_ra - $lat_rw}")
                     ratio=$(awk "BEGIN {printf \"%.1f\", $lat_ra / $lat_rw}")

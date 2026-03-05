@@ -1,10 +1,13 @@
--- pgbench script for STANDBY: full-table sequential scan.
+-- pgbench script for STANDBY: full-table sequential scan with per-row sleep.
 --
--- Each execution reads all ~20 pages of freeze_test, briefly pinning each
--- buffer as it reads and processes the tuples on that page.
+-- pg_sleep(0.001) is evaluated in the WHERE clause for each row.
+-- During pg_sleep, the backend sleeps but KEEPS the buffer pin on the
+-- current page. With 5 rows/page × 1ms sleep = 5ms pin per page.
 --
--- Run 80 parallel copies on ~20 pages: 4 expected pins per page.
--- Zero-pin windows are too brief (~0.5μs) for the startup process to wake
--- (~5μs) and acquire LockBufferForCleanup. Result: true livelock.
+-- 80 scanners on ~20 pages with 5ms pins: the pgbench protocol overhead
+-- (~200μs between queries) becomes negligible, giving ~97% duty cycle.
+-- Effective concurrent pins per page ≈ 4 → true livelock.
 
-SELECT sum(length(a) + length(b) + length(c)) FROM freeze_test;
+SELECT sum(length(a) + length(b) + length(c))
+FROM freeze_test
+WHERE pg_sleep(0.001) IS NOT NULL;
