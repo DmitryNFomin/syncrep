@@ -713,22 +713,20 @@ EOSQL
 # SCENARIO 9: Buffer pin contention during VACUUM FREEZE replay
 # ══════════════════════════════════════════════════════════════════════════════
 scenario9() {
-    hdr "SCENARIO 9: Buffer pin contention during VACUUM FREEZE replay"
+    hdr "SCENARIO 9: Buffer pin contention BLOCKS VACUUM FREEZE replay"
     echo "  Mechanism: XLOG_HEAP2_FREEZE_PAGE replay calls"
-    echo "  ResolveRecoveryConflictWithBufferPin() on each frozen page."
-    echo "  With max_standby_streaming_delay=-1, the startup process waits for"
-    echo "  ALL pins on that buffer to drop before acquiring the cleanup lock."
+    echo "  LockBufferForCleanup() which requires pin count = 1."
+    echo "  With max_standby_streaming_delay=-1, the startup process waits"
+    echo "  indefinitely for ALL pins to drop before acquiring cleanup lock."
     echo ""
-    echo "  Tuned for high-spec HW: compact table (~1000 pages) + 20 scanners"
-    echo "  doing expensive per-row work (sum(length(a)+length(b)+length(c)))."
-    echo "  On beefy HW, scanners cycle through 1000 pages in ~20ms (fast CPUs)."
-    echo "  P(collision) ≈ 20 × 200μs / 20ms ≈ 20% — significant but non-blocking."
-    echo "  ~200 collisions per freeze × wait time ≈ tens of ms added per cycle."
+    echo "  80 concurrent scans on a compact table (~1000 pages) create a"
+    echo "  livelock: each time the startup process releases and re-acquires"
+    echo "  the buffer lock, a new scanner has already pinned the page."
+    echo "  Result: replay is completely blocked for the scan duration."
     echo ""
-    echo "  Unlike scenarios 2/7 (one snapshot blocks all replay for 90s),"
-    echo "  this produces many small per-page stalls that aggregate to seconds."
-    echo "  Stalls are amplified by CHECKPOINT-induced FPIs (each frozen page"
-    echo "  also gets an 8KB full-page image after the preceding CHECKPOINT)."
+    echo "  This is a BLOCKING scenario (like S2/S7/S8) but with a different"
+    echo "  mechanism: no long-running queries or old snapshots needed —"
+    echo "  just normal sequential scan traffic on the standby."
     echo ""
 
     set_sync_mode "local"
@@ -754,15 +752,14 @@ scenario9() {
                   UPDATE freeze_test SET b = repeat(chr(65 + (id % 26)::int), 500)
                   WHERE id % 3 = 0;" >/dev/null
 
-        # Start 20 parallel full-table scans on standby to build buffer pin pressure.
-        # Each scan processes ~1000 pages with expensive per-row computation
-        # (sum of length() on 3 wide text columns), holding pins ~200μs per page.
-        # On beefy HW, scan cycle ≈ 20ms → P(collision) ≈ 20 × 200μs / 20ms ≈ 20%.
-        # 80 scanners caused 100% collision (complete stall) on fast hardware.
-        log "Starting 20 parallel full-table scans on standby (pin pressure)..."
+        # Start 80 parallel full-table scans on standby to create pin pressure.
+        # Each scan processes ~1000 pages. On beefy HW, scanners cycle fast
+        # enough that LockBufferForCleanup() can never find a page with pin
+        # count = 1. This completely blocks VACUUM FREEZE replay.
+        log "Starting 80 parallel full-table scans on standby (pin livelock)..."
         $PGBENCH_S \
             -f $SQL_DIR/scenario9_buffer_pin/standby_scanner.sql \
-            -c 20 -j 4 -T 75 --no-vacuum 2>/dev/null &
+            -c 80 -j 8 -T 75 --no-vacuum 2>/dev/null &
         SCANNER_PID=$!
         sleep 3  # let scanners get going
 
@@ -801,8 +798,8 @@ scenario9() {
         echo ""
     done
 
-    print_comparison "SCENARIO 9" "$RESULTS_DIR/s9_remote_write.log" \
-                     "$RESULTS_DIR/s9_remote_apply.log" 1.2
+    print_blocking_comparison "SCENARIO 9" "$RESULTS_DIR/s9_remote_write.log" \
+                              "$RESULTS_DIR/s9_remote_apply.log"
 }
 
 # ══════════════════════════════════════════════════════════════════════════════

@@ -15,11 +15,12 @@
 -- that ANY given page has a pin at the moment the startup process requests it.
 -- Each such collision costs up to one scan iteration worth of wait time.
 --
--- TUNING FOR HIGH-SPEC HARDWARE:
--- Fewer pages (~1000) + 20 scanners + expensive per-row work = moderate
--- collision probability. On fast CPUs, scan cycle ≈ 20ms (not 100ms),
--- so P ≈ 20 × 200μs / 20ms ≈ 20%. 80 scanners caused 100% collision
--- (complete replay stall) on beefy hardware.
+-- BLOCKING ON HIGH-SPEC HARDWARE:
+-- 80 concurrent scanners on ~1000 pages create a pin livelock:
+-- LockBufferForCleanup() needs pin_count=1, but each time the startup
+-- process releases and re-acquires the buffer lock, a new scanner has
+-- already pinned the page. Replay is completely blocked for the scan
+-- duration. This is a BLOCKING scenario, not a gradual-delay one.
 --
 -- The effect is amplified by running a CHECKPOINT before VACUUM FREEZE:
 -- PostgreSQL's full_page_writes means the first modification to each page after

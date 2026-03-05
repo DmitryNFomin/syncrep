@@ -428,7 +428,7 @@ BLOCKED — remote_apply: 0 TPS for 60s out of 70s (170x TPS drop)
 
 ---
 
-### S9 — Buffer pin contention (VACUUM FREEZE replay)
+### S9 — Buffer pin livelock BLOCKS VACUUM FREEZE replay
 
 ```bash
 bash run.sh 9   # ~7 min
@@ -439,27 +439,26 @@ columns of ~500 chars each). A probe table (`probe_s9`) takes the latency
 measurement.
 
 **What it does**:
-1. Starts 80 parallel full-table scans on the standby — each scan does
-   expensive per-row computation (`sum(length(a) + length(b) + length(c))`),
-   holding a buffer pin ~200 μs per page.
+1. Starts 80 parallel full-table scans on the standby.
 2. Runs a VACUUM FREEZE loop on the primary (12 iterations, local sync).
 3. Simultaneously probes primary commit latency (45 s).
 
 **Mechanism**: `XLOG_HEAP2_FREEZE_PAGE` replay calls `LockBufferForCleanup()`,
-which waits for all pins on that buffer to drop. With 80 concurrent scanners
-cycling through ~1000 pages, collision probability P ≈ 16%. Each of the ~160
-collisions per VACUUM FREEZE pass costs ~200 μs of wait, totalling ~32 ms
-added delay per pass.
+which requires `pin_count = 1`. With 80 concurrent scanners on ~1000 pages,
+a **livelock** occurs: each time the startup process releases and re-acquires
+the buffer lock to check pin count, a new scanner has already pinned the page.
+Replay is completely blocked for the scan duration.
 
-**Character**: Unlike S2/S7/S8 (complete stall), this produces many small
-per-page delays that aggregate. Effect shows most clearly as elevated latency
-stddev and p99, not necessarily in the average.
+**Character**: This is a **BLOCKING** scenario like S2/S7/S8, but with a
+fundamentally different trigger: no long-running queries, no old snapshots —
+just normal sequential scan traffic on the standby. On beefy hardware (fast
+CPUs = fast scan cycles), the effect is binary: 80 scanners = complete stall,
+20 scanners = invisible. There is no gradual middle ground.
 
-**What to look for**: Slightly uneven progress lines with higher stddev than
-S1. The `replay_lag` bytes will oscillate — rising when pins collide, draining
-between collisions.
+**What to look for**: 0 TPS in `remote_apply` progress lines while scanners
+are active. `replay_lag` grows continuously during the stall.
 
-**Typical result**: +10–30 ms average; stronger effect in p99
+**Typical result**: BLOCKED — 0 TPS for 45+ seconds
 
 ---
 
