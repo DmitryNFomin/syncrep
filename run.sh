@@ -200,10 +200,10 @@ print_blocking_comparison() {
 # ══════════════════════════════════════════════════════════════════════════════
 scenario1() {
     hdr "SCENARIO 1: Index-heavy batch UPDATE saturation"
-    echo "  Strategy: 16 clients UPDATE 50 SCATTERED rows per commit, 15 indexes."
+    echo "  Strategy: 32 clients UPDATE 100 SCATTERED rows per commit, 15 indexes."
     echo "  Scattered = each row on a different heap page + different index leaf pages."
-    echo "  Each commit → ~800 distinct page modifications replayed serially."
-    echo "  Contiguous rows share pages (fast). Scattered rows = random I/O (slow)."
+    echo "  Each commit → ~1600 distinct page modifications replayed serially."
+    echo "  32 clients generating heavy WAL concurrently → replay backlog builds."
     echo ""
 
     set_sync_mode "local"
@@ -218,10 +218,10 @@ scenario1() {
         $PSQL -c "CHECKPOINT;" >/dev/null
         sleep 2
 
-        log "Running pgbench (16 clients, 45s)..."
+        log "Running pgbench (32 clients, 45s)..."
         $PGBENCH \
             -f $SQL_DIR/scenario1_saturate_indexes/workload.sql \
-            -c 16 -j 8 -T 45 -P 5 --progress-timestamp 2>&1 \
+            -c 32 -j 8 -T 45 -P 5 --progress-timestamp 2>&1 \
             | tee "$RESULTS_DIR/s1_${MODE}.log"
 
         show_repl
