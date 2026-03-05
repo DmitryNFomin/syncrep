@@ -71,7 +71,6 @@ millisecond of replay adds directly to commit latency.
 | S8 VACUUM FULL lock | Replay stall (lock) | **BLOCKED** (0 TPS for 60-80s) | **No** |
 | S9 Buffer pin | Replay stall (buffer pin) | +10–30 ms | **No** |
 | S10 Large UPDATE | WAL replay throughput | ~350 ms | **No** |
-| S15 Anti-wraparound VACUUM | WAL volume (FREEZE + FPI) | **hours at 1 TB** | **No** |
 | S12 Logical rewrite | pg_fsync per rewrite record | scales with rows | **No** |
 | S11 DROP partitions | unlink() per file on replay | scales with N parts | **No** |
 | S14 Replay saturation | WAL gen > single-thread replay | grows with concurrency | **No** |
@@ -86,7 +85,7 @@ of misleading average latency.
 
 **Key insight**: `hot_standby_feedback = on` prevents only snapshot conflicts
 (S2, S7). Lock conflicts (S8), buffer-pin stalls (S9), and all
-non-conflict replay overhead (S4, S10–S12, S14–S15) are unaffected — because
+non-conflict replay overhead (S4, S10–S12, S14) are unaffected — because
 they have nothing to do with row visibility. See [Effect of
 `hot_standby_feedback`](#effect-of-hot_standby_feedback) for the full
 tradeoff including the bloat cost.
@@ -145,7 +144,7 @@ replication this is already set. Otherwise S12 is automatically skipped with a
 warning — no other scenario requires it.
 
 ```sql
-SHOW wal_level;   -- 'logical' for S12, 'replica' is fine for S1–S11, S13–S15
+SHOW wal_level;   -- 'logical' for S12, 'replica' is fine for all others
 ```
 
 ### Standby configuration (handled automatically)
@@ -222,7 +221,7 @@ remote_write`, once under `remote_apply` — and prints the difference.
 All tables are created automatically; no manual setup is needed.
 
 **Default scenarios** (run by `bash run.sh` with no arguments):
-S1, S2, S3, S4, S7, S8, S9, S10, S11, S12, S14, S15
+S1, S2, S3, S4, S7, S8, S9, S10, S11, S12, S14
 
 **Run all scenarios** (~90 min total):
 ```bash
@@ -614,37 +613,29 @@ not exist under `remote_write`.
 
 ---
 
-### S15 — Anti-wraparound VACUUM (probe-based, zero conflicts)
+---
+
+## Non-default scenarios
+
+These can be run explicitly but are not included in `bash run.sh`:
+
+### S15 — Anti-wraparound VACUUM (zero conflicts)
 
 ```bash
 bash run.sh 15   # ~15 min (5 M-row table load, then 2× UPDATE + CHECKPOINT + VACUUM FREEZE)
 ```
 
-**Setup**: `antiwrap_test` table (5 M rows: bigint PK + md5 payload +
-300-char filler). A probe table (`probe_s15`) takes the latency measurement.
-
-**What it does**:
-1. Updates all rows deterministically (creates unfrozen tuples).
-2. Runs `CHECKPOINT` — marks all pages "clean" so VACUUM FREEZE emits FPIs.
-3. Starts a pgbench probe (8 clients, 60 s) measuring INSERT latency on
-   `probe_s15`.
-4. After 5 s, runs `VACUUM FREEZE antiwrap_test` with `local` sync — generates
-   FREEZE_PAGE + FPI WAL for every page.
-5. Under `remote_apply`, probe commits must wait for the VACUUM's WAL to be
-   replayed before the probe's commit position is reached.
+**Why not in defaults**: VACUUM FREEZE on a 5 M-row table generates WAL at
+~40 MB/s, but single-threaded replay handles 500+ MB/s on modern hardware.
+The effect only manifests with very large tables (100 GB+) where the sheer
+WAL volume exceeds replay throughput.
 
 **Mechanism**: Anti-wraparound autovacuum generates WAL proportional to table
 size at full I/O speed. A `CHECKPOINT` before VACUUM FREEZE amplifies WAL
-(8 KB FPI per page). The VACUUM WAL is interleaved with probe commit records
-in the WAL stream. Under `remote_apply`, each probe commit must wait for
+(8 KB FPI per page). Under `remote_apply`, each commit must wait for
 preceding VACUUM WAL to be replayed.
 
-**What to look for**: Elevated latency in pgbench progress lines during the
-VACUUM FREEZE window, dropping back to baseline after VACUUM finishes.
-
-**Typical result**: +10–30 ms during VACUUM FREEZE
-
-**Scale**:
+**Scale** (where the scenario matters):
 
 | Table size | FPI WAL | Replay at 300 MB/s | `remote_apply` stall |
 |------------|---------|---------------------|----------------------|
@@ -654,12 +645,6 @@ VACUUM FREEZE window, dropping back to baseline after VACUUM finishes.
 
 Every `remote_apply` commit issued during that window waits. This is a
 recurring, automatic, unavoidable event on long-lived large tables.
-
----
-
-## Non-default scenarios
-
-These can be run explicitly but are not included in `bash run.sh`:
 
 ### S5 — Bulk INSERT / ETL load
 
@@ -711,7 +696,7 @@ for reliable demonstration. Typical result: +1–5 ms.
 | S10 Large UPDATE | replay throughput | adds ms | **no effect** |
 | S11 DROP partitions | fs ops on replay | adds ms | **no effect** |
 | S14 Replay saturation | WAL gen > replay rate | grows with concurrency | **no effect** |
-| S15 Anti-wraparound VACUUM | WAL volume (FREEZE+FPI) | hours at 1 TB scale | **no effect** |
+| S15 Anti-wraparound VACUUM* | WAL volume (FREEZE+FPI) | hours at 1 TB scale | **no effect** |
 
 `hot_standby_feedback = on` prevents snapshot conflicts by advertising the
 standby's oldest active xmin to the primary, causing VACUUM to skip rows that
@@ -726,7 +711,8 @@ tradeoff: use `hsf=on` to protect against snapshot-conflict stalls; accept
 bloat risk.
 
 Lock conflicts (S8), buffer-pin conflicts (S9), and all non-conflict replay
-overhead (S10–S12, S14–S15) are unaffected regardless of this setting.
+overhead (S10–S12, S14) are unaffected regardless of this setting.
+(*S15 is a non-default scenario — requires 100 GB+ tables to see the effect.)
 
 ---
 

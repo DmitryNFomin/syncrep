@@ -1181,6 +1181,10 @@ scenario14() {
 # ══════════════════════════════════════════════════════════════════════════════
 # SCENARIO 15: Anti-wraparound VACUUM — large WAL volume, zero conflicts
 # ══════════════════════════════════════════════════════════════════════════════
+# NOT IN DEFAULTS: VACUUM FREEZE on a 5M-row table generates WAL at ~40 MB/s,
+# but single-threaded replay handles 500+ MB/s on modern hardware.  The effect
+# only manifests with very large tables (100 GB+) where the sheer WAL volume
+# exceeds replay throughput.  Run manually:  bash run.sh 15
 scenario15() {
     hdr "SCENARIO 15: Anti-wraparound VACUUM — large WAL volume, zero conflicts"
     echo "  Mechanism: VACUUM FREEZE writes XLOG_HEAP2_FREEZE_PAGE for every page."
@@ -1279,7 +1283,7 @@ main() {
 
     local scenarios=("${@}")
     if [ ${#scenarios[@]} -eq 0 ]; then
-        scenarios=(1 2 3 4 7 8 9 10 11 12 14 15)
+        scenarios=(1 2 3 4 7 8 9 10 11 12 14)
     fi
 
     for s in "${scenarios[@]}"; do

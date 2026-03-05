@@ -152,7 +152,7 @@ main() {
 
     local -a missing_list=()  # human-readable list of unavailable scenario IDs
 
-    for N in 1 2 3 4 7 8 9 14 15; do
+    for N in 1 2 3 4 7 8 9 14; do
         local rw_f="${RESULTS_DIR}/s${N}_remote_write.log"
         local ra_f="${RESULTS_DIR}/s${N}_remote_apply.log"
         local name
