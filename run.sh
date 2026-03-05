@@ -1414,6 +1414,21 @@ main() {
                 continue
             fi
 
+            # S11: wall-clock DROP TABLE time (not pgbench)
+            if [ "$S_NUM" = "11" ]; then
+                local t_rw t_ra
+                t_rw=$(grep 'DROP TABLE wall time' "$rw_f" | awk '{print $(NF-1)}')
+                t_ra=$(grep 'DROP TABLE wall time' "$ra_f" | awk '{print $(NF-1)}')
+                if [ -n "$t_rw" ] && [ -n "$t_ra" ]; then
+                    local added ratio
+                    added=$(awk "BEGIN {printf \"%.1f\", $t_ra - $t_rw}")
+                    ratio=$(awk "BEGIN {printf \"%.1f\", $t_ra / $t_rw}")
+                    printf "  S%-3d %14s %14s %+13.1f %7sx\n" \
+                        "$S_NUM" "$t_rw" "$t_ra" "$added" "$ratio"
+                fi
+                continue
+            fi
+
             # S12: wall-clock VACUUM FULL time (not pgbench)
             if [ "$S_NUM" = "12" ]; then
                 local t_rw t_ra
@@ -1437,16 +1452,16 @@ main() {
                 local blocked_s=$(( zero_int * 5 ))
                 local total_s=$(( total_int * 5 ))
                 local lat_rw tps_rw tps_ra tps_ratio
-                lat_rw=$(extract_avg_latency "$rw_f")
-                tps_rw=$(extract_tps "$rw_f")
-                tps_ra=$(extract_tps "$ra_f")
+                lat_rw=$(extract_avg_latency "$rw_f" || true)
+                tps_rw=$(extract_tps "$rw_f" || true)
+                tps_ra=$(extract_tps "$ra_f" || true)
                 tps_ratio=$(awk "BEGIN {printf \"%.0f\", $tps_rw / $tps_ra}")
                 printf "  S%-3d %14s    ${RED}${BOLD}BLOCKED${NC}  ← 0 TPS for %d/%ds (%sx TPS drop)\n" \
                     "$S_NUM" "${lat_rw:-?}" "$blocked_s" "$total_s" "$tps_ratio"
             else
                 local lat_rw lat_ra added ratio
-                lat_rw=$(extract_avg_latency "$rw_f")
-                lat_ra=$(extract_avg_latency "$ra_f")
+                lat_rw=$(extract_avg_latency "$rw_f" || true)
+                lat_ra=$(extract_avg_latency "$ra_f" || true)
                 if [ -n "$lat_rw" ] && [ -n "$lat_ra" ]; then
                     added=$(awk "BEGIN {printf \"%.1f\", $lat_ra - $lat_rw}")
                     ratio=$(awk "BEGIN {printf \"%.1f\", $lat_ra / $lat_rw}")
