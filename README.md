@@ -433,9 +433,10 @@ BLOCKED — remote_apply: 0 TPS for 60s out of 70s (170x TPS drop)
 bash run.sh 9   # ~7 min
 ```
 
-**Setup**: `freeze_test` table (5 K wide rows, ~1000 pages — 3 wide text
+**Setup**: `freeze_test` table (100 wide rows, ~20 pages — 3 wide text
 columns of ~500 chars each). A probe table (`probe_s9`) takes the latency
-measurement.
+measurement. The tiny table is key: 80 scanners / 20 pages = 4 expected
+pins per page.
 
 **What it does**:
 1. Starts 80 parallel full-table scans on the standby.
@@ -443,16 +444,15 @@ measurement.
 3. Simultaneously probes primary commit latency (45 s).
 
 **Mechanism**: `XLOG_HEAP2_FREEZE_PAGE` replay calls `LockBufferForCleanup()`,
-which requires `pin_count = 1`. With 80 concurrent scanners on ~1000 pages,
-a **livelock** occurs: each time the startup process releases and re-acquires
-the buffer lock to check pin count, a new scanner has already pinned the page.
-Replay is completely blocked for the scan duration.
+which requires `pin_count = 1`. With 80 concurrent scanners on ~20 pages,
+expected pins per page = 4. Zero-pin windows last only ~0.5 μs — far shorter
+than the ~5 μs the startup process needs to wake and acquire the cleanup lock.
+Result: true **livelock**. Replay is completely blocked for the scan duration.
 
 **Character**: This is a **BLOCKING** scenario like S2/S7/S8, but with a
 fundamentally different trigger: no long-running queries, no old snapshots —
-just normal sequential scan traffic on the standby. On beefy hardware (fast
-CPUs = fast scan cycles), the effect is binary: 80 scanners = complete stall,
-20 scanners = invisible. There is no gradual middle ground.
+just normal sequential scan traffic on the standby. The critical tuning
+parameter is the scanners-to-pages ratio, not the total table size.
 
 **What to look for**: 0 TPS in `remote_apply` progress lines while scanners
 are active. `replay_lag` grows continuously during the stall.

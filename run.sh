@@ -354,9 +354,10 @@ scenario4() {
     hdr "SCENARIO 4: Schema migration (parallel UPDATE + CREATE INDEX)"
     echo "  Strategy: 4 concurrent UPDATEs of 500K rows each (touching indexed"
     echo "  columns) + 2 CREATE INDEX — all with synchronous_commit=local."
-    echo "  4 parallel sessions generate WAL simultaneously → combined rate"
-    echo "  exceeds single-threaded replay throughput → WAL backlog builds."
-    echo "  Probe commits under remote_apply must wait behind the backlog."
+    echo "  The initial CHECKPOINT causes full-page images (8 KB each) for every"
+    echo "  page modified — creating a brief but massive WAL burst (~500 MB in"
+    echo "  ~10s) that overwhelms single-threaded replay."
+    echo "  A short 25s probe captures this burst with minimal dilution."
     echo ""
 
     set_sync_mode "local"
@@ -376,21 +377,14 @@ scenario4() {
               -c "DROP INDEX IF EXISTS events_svc_dur" >/dev/null 2>&1
         sleep 3
 
-        log "Starting probe pgbench (16 clients, 90s)..."
-        $PGBENCH \
-            -f $SQL_DIR/scenario4_create_index/workload_probe.sql \
-            -c 16 -j 8 -T 90 -P 5 --progress-timestamp 2>&1 \
-            | tee "$RESULTS_DIR/s4_${MODE}.log" &
-        PGBENCH_PID=$!
-
-        sleep 5
-
         log "Running parallel migration (4× UPDATE + 2× CREATE INDEX, local sync)..."
         local t0=$(date +%s)
 
         # 4 parallel UPDATEs, each handling 500K rows.
-        # Combined WAL generation from 4 sessions: ~320 MB/s → exceeds
-        # single-threaded replay (~500 MB/s for small records).
+        # After CHECKPOINT, the first modification to each page generates
+        # an 8 KB full-page image (FPI).  This creates a massive WAL burst
+        # in the first ~10-15s that overwhelms single-threaded replay.
+        local -a UPDATE_PIDS=()
         for PART in 1 2 3 4; do
             local start_id=$(( (PART - 1) * 500000 + 1 ))
             local end_id=$(( PART * 500000 ))
@@ -398,8 +392,20 @@ scenario4() {
                   -c "SET maintenance_work_mem = '256MB'" \
                   -c "UPDATE events SET user_id = user_id + 1, duration_ms = duration_ms + 1, payload = upper(payload) WHERE id BETWEEN $start_id AND $end_id" \
                   >/dev/null 2>&1 &
+            UPDATE_PIDS+=($!)
         done
-        wait
+
+        # Start probe SIMULTANEOUSLY with migration — 25s captures
+        # the FPI burst with minimal dilution from post-burst calm.
+        sleep 2  # let UPDATEs ramp up WAL generation
+        log "Starting probe pgbench (16 clients, 25s)..."
+        $PGBENCH \
+            -f $SQL_DIR/scenario4_create_index/workload_probe.sql \
+            -c 16 -j 8 -T 25 -P 5 --progress-timestamp 2>&1 \
+            | tee "$RESULTS_DIR/s4_${MODE}.log" &
+        PGBENCH_PID=$!
+
+        for pid in "${UPDATE_PIDS[@]}"; do wait "$pid" 2>/dev/null || true; done
         log "  parallel UPDATE done ($(( $(date +%s) - t0 ))s elapsed)"
 
         $PSQL -c "SET synchronous_commit TO local" \
@@ -719,9 +725,9 @@ scenario9() {
     echo "  With max_standby_streaming_delay=-1, the startup process waits"
     echo "  indefinitely for ALL pins to drop before acquiring cleanup lock."
     echo ""
-    echo "  80 concurrent scans on a compact table (~1000 pages) create a"
-    echo "  livelock: each time the startup process releases and re-acquires"
-    echo "  the buffer lock, a new scanner has already pinned the page."
+    echo "  80 concurrent scans on a tiny table (~20 pages) create a"
+    echo "  livelock: 4 expected pins per page means the startup process"
+    echo "  can never find a zero-pin window long enough to acquire the lock."
     echo "  Result: replay is completely blocked for the scan duration."
     echo ""
     echo "  This is a BLOCKING scenario (like S2/S7/S8) but with a different"
@@ -730,7 +736,7 @@ scenario9() {
     echo ""
 
     set_sync_mode "local"
-    log "Loading freeze_test (5K wide rows, ~1000 pages — takes ~5s)..."
+    log "Loading freeze_test (100 wide rows, ~20 pages)..."
     $PSQL -f $SQL_DIR/scenario9_buffer_pin/setup.sql >/dev/null 2>&1
     set_sync_mode "remote_write"
     wait_for_catchup 120
@@ -753,9 +759,9 @@ scenario9() {
                   WHERE id % 3 = 0;" >/dev/null
 
         # Start 80 parallel full-table scans on standby to create pin pressure.
-        # Each scan processes ~1000 pages. On beefy HW, scanners cycle fast
-        # enough that LockBufferForCleanup() can never find a page with pin
-        # count = 1. This completely blocks VACUUM FREEZE replay.
+        # 80 scanners on ~20 pages = 4 expected pins per page.
+        # Zero-pin windows are ~0.5μs — too brief for the startup process
+        # to wake (~5μs) and acquire the cleanup lock. True livelock.
         log "Starting 80 parallel full-table scans on standby (pin livelock)..."
         $PGBENCH_S \
             -f $SQL_DIR/scenario9_buffer_pin/standby_scanner.sql \

@@ -16,11 +16,12 @@
 -- Each such collision costs up to one scan iteration worth of wait time.
 --
 -- BLOCKING ON HIGH-SPEC HARDWARE:
--- 80 concurrent scanners on ~1000 pages create a pin livelock:
--- LockBufferForCleanup() needs pin_count=1, but each time the startup
--- process releases and re-acquires the buffer lock, a new scanner has
--- already pinned the page. Replay is completely blocked for the scan
--- duration. This is a BLOCKING scenario, not a gradual-delay one.
+-- 80 concurrent scanners on ~20 pages create a pin livelock:
+-- expected pins per page = 80/20 = 4.  P(zero pins) = e^(-4) = 1.8%.
+-- Even when a zero-pin instant occurs, the window lasts ~0.5μs — far
+-- shorter than the ~5μs needed for the startup process to wake up and
+-- acquire the cleanup lock.  Result: true livelock, not probabilistic.
+-- Replay is completely blocked for the scan duration.
 --
 -- The effect is amplified by running a CHECKPOINT before VACUUM FREEZE:
 -- PostgreSQL's full_page_writes means the first modification to each page after
@@ -39,10 +40,13 @@
 DROP TABLE IF EXISTS freeze_test;
 DROP TABLE IF EXISTS probe_s9;
 
--- Table sized for high collision probability on fast hardware:
--- ~1600 bytes/row → ~5 rows/8KB page → 5000 rows ≈ 1000 pages.
--- Fewer pages means scanners cycle through them faster → higher pin density.
--- Wide inline text columns force per-row computation to hold pins longer.
+-- Table sized for GUARANTEED pin livelock on fast hardware:
+-- ~1600 bytes/row → ~5 rows/8KB page → 100 rows ≈ 20 pages.
+-- With 80 concurrent scanners on 20 pages, expected pins per page = 4.
+-- Probability of finding a page unpinned: e^(-4) ≈ 1.8%.
+-- Even when a zero-pin instant occurs, the window is ~0.5μs — far shorter
+-- than the startup process needs to wake up and acquire the cleanup lock.
+-- Result: true livelock, not probabilistic delay.
 -- autovacuum_enabled=false: prevents autovacuum from preempting our manual FREEZE.
 CREATE TABLE freeze_test (
     id   bigint,
@@ -58,7 +62,7 @@ SELECT i,
        repeat(chr(65 + ((i + 7) % 26)), 500),
        repeat(chr(65 + ((i + 13) % 26)), 500),
        now()
-FROM generate_series(1, 5000) i;
+FROM generate_series(1, 100) i;
 
 -- Probe table on which we measure commit latency.
 -- This is deliberately a different table from freeze_test: the buffer pin
