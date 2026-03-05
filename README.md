@@ -62,6 +62,42 @@ Under `remote_write`, none of this matters — the primary only waits for the
 WAL bytes to reach the standby's memory. Under `remote_apply`, every extra
 millisecond of replay adds directly to commit latency.
 
+### Pipelining and network latency
+
+Both modes use the same WAL sender, which streams WAL continuously without
+waiting for acknowledgment between records. This **pipelining** means
+throughput is not limited to one commit per network round trip — hundreds of
+commits can be in-flight simultaneously.
+
+However, every individual commit still waits in `SyncRepWaitForLSN()` until
+the standby acknowledges its LSN. With 10 ms one-way network latency (20 ms
+RTT), every commit pays at least ~20 ms regardless of mode.
+
+The critical difference is **how the standby acknowledges**:
+
+- **`remote_write`**: the standby writes WAL to OS page cache — effectively
+  instant for all concurrent commits. One feedback message comes back and
+  releases all waiting backends at once. 100 concurrent commits each pay
+  ~20 ms, and all finish at roughly the same time.
+
+- **`remote_apply`**: the standby startup process **replays** WAL
+  sequentially (single-threaded). `replay_lsn` advances one commit at a
+  time. Feedback messages come back as replay progresses, releasing backends
+  in batches. The first commits in the queue pay ~20 ms (same as
+  `remote_write`), but later commits must wait for all preceding WAL to be
+  replayed first.
+
+Under **light load** (small transactions, replay keeps up), the total replay
+time for all concurrent commits is sub-millisecond — effectively identical
+to `remote_write`.
+
+Under **heavy load** (many writers, large transactions), replay cannot keep
+up, the queue grows, and later commits pay RTT + full queue drain time. This
+is the fundamental asymmetry: **`remote_write` acknowledgments are parallel
+(OS cache write is instant), `remote_apply` acknowledgments are serialized
+through single-threaded replay.** This is exactly what the benchmark
+scenarios demonstrate.
+
 ### Latency sources at a glance
 
 | Scenario | Mechanism | Magnitude | `hsf=on` fixes it? |
