@@ -1262,7 +1262,7 @@ main() {
 
     local scenarios=("${@}")
     if [ ${#scenarios[@]} -eq 0 ]; then
-        scenarios=(1 2 3 4 6 7 8 9 10 11 12 14 15)
+        scenarios=(1 2 3 4 7 8 9 10 11 12 14 15)
     fi
 
     for s in "${scenarios[@]}"; do

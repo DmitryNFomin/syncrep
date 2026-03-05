@@ -3,7 +3,7 @@
 Demonstrates **when and why** `synchronous_commit = remote_apply` adds latency
 compared to `remote_write` on a live PostgreSQL synchronous-replication cluster.
 
-Fifteen scenarios cover every distinct mechanism: snapshot conflicts, lock
+Twelve default scenarios cover every distinct mechanism: snapshot conflicts, lock
 conflicts, buffer-pin stalls, WAL replay throughput, per-record fsync overhead,
 and replay saturation at high concurrency. Each scenario is self-contained.
 
@@ -66,28 +66,47 @@ millisecond of replay adds directly to commit latency.
 
 | Scenario | Mechanism | Magnitude | `hsf=on` fixes it? |
 |----------|-----------|-----------|---------------------|
-| S2 Snapshot conflict | Replay stall (snapshot) | **20×** | Yes |
-| S7 Cross-table blast | Replay stall (snapshot) | **350×** | Yes |
-| S8 VACUUM FULL lock | Replay stall (lock) | **170×** | **No** |
-| S9 Buffer pin | Replay stall (buffer pin) | ~5 ms | **No** |
-| S13 Hash VACUUM | Replay stall (snapshot + pin) | ~1 ms | Mostly |
+| S2 Snapshot conflict | Replay stall (snapshot) | **BLOCKED** (0 TPS for 60-80s) | Yes |
+| S7 Cross-table blast | Replay stall (snapshot) | **BLOCKED** (0 TPS for 60-80s) | Yes |
+| S8 VACUUM FULL lock | Replay stall (lock) | **BLOCKED** (0 TPS for 60-80s) | **No** |
+| S9 Buffer pin | Replay stall (buffer pin) | +10–30 ms | **No** |
 | S10 Large UPDATE | WAL replay throughput | ~350 ms | **No** |
 | S15 Anti-wraparound VACUUM | WAL volume (FREEZE + FPI) | **hours at 1 TB** | **No** |
 | S12 Logical rewrite | pg_fsync per rewrite record | scales with rows | **No** |
 | S11 DROP partitions | unlink() per file on replay | scales with N parts | **No** |
-| S14 Replay saturation | WAL gen > single-thread replay | grows with CPU count | **No** |
+| S14 Replay saturation | WAL gen > single-thread replay | grows with concurrency | **No** |
 | S4 CREATE INDEX | Index build on replay | ~17 ms | **No** |
-| S5 Bulk INSERT | WAL replay throughput | ~15 ms | **No** |
-| S6 FPI storm | WAL volume (full-page images) | **minutes at 75 GB shbuf** | **No** |
-| S1 Normal OLTP | Baseline RTT + replay | ~5 ms | — |
-| S3 GIN/TOAST | WAL volume (bursty records) | ~1 ms | — |
+| S1 Index-heavy batch | Baseline RTT + replay | +10–15 ms | — |
+| S3 GIN/TOAST batch | CPU-bound GIN replay | +10–15 ms | — |
+
+**Blocking scenarios** (S2, S7, S8): `remote_apply` commits freeze completely
+(0 TPS) for the entire duration of the standby conflict. The benchmark detects
+this via pgbench progress lines and reports `BLOCKED — 0 TPS for Xs` instead
+of misleading average latency.
 
 **Key insight**: `hot_standby_feedback = on` prevents only snapshot conflicts
-(S2, S7, S13). Lock conflicts (S8), buffer-pin stalls (S9), and all
-non-conflict replay overhead (S4–S6, S10–S12) are unaffected — because they
-have nothing to do with row visibility. See [Effect of
+(S2, S7). Lock conflicts (S8), buffer-pin stalls (S9), and all
+non-conflict replay overhead (S4, S10–S12, S14–S15) are unaffected — because
+they have nothing to do with row visibility. See [Effect of
 `hot_standby_feedback`](#effect-of-hot_standby_feedback) for the full
 tradeoff including the bloat cost.
+
+### Excluded scenarios
+
+Three scenarios are excluded from defaults because their effects are too
+marginal to demonstrate reliably:
+
+- **S5** (Bulk INSERT): single large INSERT; added latency depends on
+  standby I/O throughput but is typically < 5 ms on fast storage.
+- **S6** (FPI storm): Full Page Image amplification after checkpoints.
+  The effect scales with `shared_buffers` size and is only dramatic at
+  production scale (64+ GB `shared_buffers`). In symmetric benchmark configs,
+  FPI replay is fast (~300–500 MB/s on NVMe) and the effect is marginal.
+- **S13** (Hash VACUUM): dual conflict (snapshot + buffer pin) exists in
+  code but the overlap window is too narrow for reliable demonstration.
+
+These scenarios remain in the repo and can be run explicitly:
+`bash run.sh 5 6 13`.
 
 ---
 
@@ -136,11 +155,11 @@ manually:
 
 ```sql
 -- Wait forever on conflicts instead of cancelling standby queries.
--- Required for conflict scenarios (S2, S7, S8, S9, S13) to be meaningful.
+-- Required for conflict scenarios (S2, S7, S8, S9) to be meaningful.
 ALTER SYSTEM SET max_standby_streaming_delay = '-1';
 
 -- Prevent the standby from suppressing VACUUM on the primary.
--- Required for snapshot-conflict scenarios (S2, S7, S13) to generate
+-- Required for snapshot-conflict scenarios (S2, S7) to generate
 -- the conflict WAL that causes replay stalls.
 ALTER SYSTEM SET hot_standby_feedback = off;
 ```
@@ -162,7 +181,7 @@ $EDITOR syncrep.conf          # fill in IPs, credentials — everything else is 
 # 2. Verify cluster, create bench DB, configure standby settings
 bash setup_patroni_env.sh
 
-# 3. Run all 15 scenarios
+# 3. Run all default scenarios (12 scenarios, ~90 min)
 bash run.sh
 
 # 4. Run a subset (e.g. scenarios 2, 7, 8 — the dramatic conflict cases)
@@ -202,7 +221,10 @@ Each scenario runs the workload twice — once under `synchronous_commit =
 remote_write`, once under `remote_apply` — and prints the difference.
 All tables are created automatically; no manual setup is needed.
 
-**Run all scenarios** (≈ 90 min total):
+**Default scenarios** (run by `bash run.sh` with no arguments):
+S1, S2, S3, S4, S7, S8, S9, S10, S11, S12, S14, S15
+
+**Run all scenarios** (~90 min total):
 ```bash
 bash run.sh
 ```
@@ -210,7 +232,7 @@ bash run.sh
 **Run one scenario**:
 ```bash
 bash run.sh 7        # just S7
-bash run.sh 2 7 8    # S2, S7, and S8 — the three dramatic conflict cases
+bash run.sh 2 7 8    # S2, S7, and S8 — the three blocking conflict cases
 ```
 
 **Watch results build up** in a second terminal:
@@ -220,32 +242,32 @@ bash report.sh       # re-run any time; reads whatever result files exist
 
 ---
 
-### S1 — Index-heavy UPDATE saturation
+### S1 — Index-heavy batch UPDATE (25 rows)
 
 ```bash
 bash run.sh 1   # ~3 min
 ```
 
-**Setup**: 2 M-row table with 6 B-tree indexes, fillfactor 50. Scattered
-UPDATEs force index maintenance on nearly every page.
+**Setup**: 2 M-row table with 6 B-tree indexes, fillfactor 50.
 
-**What it does**: Runs a 60 s pgbench workload at 24 clients under each sync
-mode. No standby blockers — this is the clean baseline.
+**What it does**: Each pgbench transaction updates 25 contiguous rows, touching
+all 6 indexes. Runs 60 s at 16 clients under each sync mode. No standby
+blockers — this is the clean baseline for batch DML.
 
-**Why latency increases**: Routine DML WAL must be replayed before each commit
-ACK under `remote_apply`. The added latency equals approximately one network
-RTT between primary and standby (the time for the replay ACK to travel back).
+**Why latency increases**: 25 rows × 6 indexes = 150 index modifications per
+commit. At ~27 μs replay per index modification, that's ~4 ms of replay work
+per commit. Under `remote_apply` each commit waits for this replay plus
+network RTT.
 
 **What to look for**:
 ```
 avg latency (ms)       remote_write   remote_apply
-                            110.2          115.1
-Added latency: +4.9 ms    MARGINAL
+                            110.2          122.5
+Added latency: +12.3 ms
 ```
-The per-5 s progress lines (printed during the run) should all stay stable —
-no spikes. This is your floor for every other scenario.
+The per-5 s progress lines should stay stable — no spikes.
 
-**Typical result**: +4–6 ms
+**Typical result**: +10–15 ms
 
 ---
 
@@ -271,20 +293,18 @@ bash run.sh 2   # ~6 min
 
 **What to look for**:
 ```
-avg latency (ms)     remote_write   remote_apply
-                          107.6         2141.4
-Added latency: +2033.9 ms    20×    PASS
+BLOCKED — remote_apply: 0 TPS for 65s out of 70s (340x TPS drop)
 ```
-Watch the per-5 s progress lines during `remote_apply` — latency should jump
-from ~110 ms to 1000–3000 ms immediately when the blocker starts, then drop
-back when the standby query finishes. The `replay_lag` column in
-`pg_stat_replication` will show the growing WAL backlog.
+Watch the per-5 s progress lines during `remote_apply` — TPS drops to 0.0
+immediately when the conflict starts, then recovers when the standby query
+finishes. The `replay_lag` column in `pg_stat_replication` shows the growing
+WAL backlog.
 
-**Typical result**: +2000 ms (20×)
+**Typical result**: BLOCKED — all commits frozen for 60–80 s
 
 ---
 
-### S3 — GIN + TOAST bursty replay
+### S3 — GIN + TOAST batch (8 rows)
 
 ```bash
 bash run.sh 3   # ~4 min
@@ -293,18 +313,18 @@ bash run.sh 3   # ~4 min
 **Setup**: `tickets` table with four GIN indexes (text search, trigrams, tags
 array, metadata jsonb). Rows contain 1–5 KB of text stored via TOAST.
 
-**What it does**: Inserts large text documents via pgbench (30 s, 8 clients).
-GIN pending-list flushes produce large, bursty WAL records; TOAST chunks
-generate many small records per row.
+**What it does**: Each pgbench transaction inserts or updates 8 rows with large
+text bodies. GIN pending-list flushes are CPU-intensive on replay (posting tree
+traversal, compression). TOAST chunks generate many small WAL records per row.
 
-**Why latency increases**: Large WAL records take longer to replay — more page
-writes per record. The overhead is proportional to WAL record size and standby
-I/O throughput. No conflict involved.
+**Why latency increases**: GIN replay is CPU-bound, not I/O-bound. Each 8-row
+batch triggers GIN pending-list flush WAL that requires expensive posting tree
+operations during single-threaded replay.
 
 **What to look for**: Per-5 s progress lines that are slightly uneven — bursty
 WAL causes small latency spikes when GIN flushes its pending list.
 
-**Typical result**: +1–3 ms (marginal on fast SSDs)
+**Typical result**: +10–15 ms
 
 ---
 
@@ -333,62 +353,6 @@ stay elevated while the index WAL replays.
 
 ---
 
-### S5 — Bulk INSERT / ETL load
-
-```bash
-bash run.sh 5   # ~4 min
-```
-
-**Setup**: `logs` table (500 K rows pre-loaded, 4 indexes). A probe table
-(`probe_s5`) measures latency during the bulk load.
-
-**What it does**: Inserts 500 K rows in a single transaction (one large commit)
-while probing primary latency with pgbench (30 s, 8 clients).
-
-**Why latency increases**: The single large INSERT generates one large WAL
-segment. The primary can only issue the commit ACK after the standby replays
-the entire segment end-to-end. Replay time scales with row count.
-
-**What to look for**: A single large latency spike in the progress lines when
-the bulk commit lands, then return to normal. Under `remote_write`, the bulk
-commit returns as soon as WAL bytes land in standby memory — no spike.
-
-**Typical result**: +10–20 ms during the bulk commit; scales linearly with rows
-
----
-
-### S6 — FPI storm (frequent checkpoints)
-
-```bash
-bash run.sh 6   # ~4 min
-```
-
-**Setup**: 2 M-row table (`wide_table`) with fillfactor 50. `checkpoint_timeout`
-is reduced to 30 s for the duration of the scenario.
-
-**What it does**: Runs pgbench (60 s, 24 clients) with aggressive checkpoints.
-After each checkpoint, the first write to any dirty page emits an 8 KB full-page
-image (FPI) rather than a ~50-byte diff WAL record — inflating WAL volume
-10–100×.
-
-**Why latency increases**: Replay must write complete 8 KB pages instead of
-applying small diffs. The standby's I/O throughput becomes the bottleneck.
-FPI bursts cause periodic latency spikes rather than a steady increase.
-
-**What to look for**: Latency spikes in the per-5 s progress lines immediately
-after each checkpoint (every 30 s). Between spikes, latency returns to near
-`remote_write` levels. The `lag_bytes` column in `pg_stat_replication` will
-show a sawtooth pattern — growing during FPI bursts, draining between them.
-
-**Typical result**: +5–15 ms during FPI bursts
-
-**Scale**: effect grows directly with `shared_buffers`. At 75 GB
-`shared_buffers` (typical for a 300 GiB server), a post-checkpoint FPI storm
-can generate 10–75 GB of WAL. At 300 MB/s replay throughput: 30–250 seconds
-of stall for every `remote_apply` commit during that window.
-
----
-
 ### S7 — Reporting query blocks replay (cross-table blast radius)
 
 ```bash
@@ -409,16 +373,14 @@ standby query finishes.
 
 **What to look for**:
 ```
-avg latency (ms)     remote_write   remote_apply
-                          109.7        38233.2
-Added latency: +38123.5 ms   349×    PASS
+BLOCKED — remote_apply: 0 TPS for 80s out of 85s (350x TPS drop)
 ```
 Watch `pg_stat_replication` during the run — `replay_lag` will show hours or
 days (the standby has completely stopped replaying), while `write_lag` and
 `flush_lag` stay at milliseconds. This gap is the visible signature of a replay
 stall.
 
-**Typical result**: +30 000–40 000 ms (300–400×)
+**Typical result**: BLOCKED — all commits frozen for 60–80 s
 
 ---
 
@@ -446,11 +408,13 @@ until the SELECT finishes or is cancelled.
 conflicts (VACUUM skipping rows needed by old snapshots). It has no effect on
 lock-type conflicts — `VACUUM FULL` requests `AccessExclusiveLock` regardless.
 
-**What to look for**: Same pattern as S7 — `replay_lag` in `pg_stat_replication`
-shows hours while the blocker holds. Latency in the progress lines jumps to
-10 000–30 000 ms for the duration of the VACUUM FULL.
+**What to look for**:
+```
+BLOCKED — remote_apply: 0 TPS for 60s out of 70s (170x TPS drop)
+```
+`replay_lag` in `pg_stat_replication` shows hours while the blocker holds.
 
-**Typical result**: +20 000–25 000 ms (150–170×)
+**Typical result**: BLOCKED — all commits frozen for 60–80 s
 
 ---
 
@@ -460,19 +424,22 @@ shows hours while the blocker holds. Latency in the progress lines jumps to
 bash run.sh 9   # ~7 min
 ```
 
-**Setup**: `freeze_test` table (300 K rows, ~60 MB). A probe table (`probe_s9`)
-takes the latency measurement.
+**Setup**: `freeze_test` table (5 K wide rows, ~1000 pages — 3 wide text
+columns of ~500 chars each). A probe table (`probe_s9`) takes the latency
+measurement.
 
 **What it does**:
-1. Starts 20 parallel full-table sequential scans on the standby — each scan
-   briefly pins every page it reads.
-2. Runs a VACUUM FREEZE loop on the primary (8 iterations, local sync).
+1. Starts 80 parallel full-table scans on the standby — each scan does
+   expensive per-row computation (`sum(length(a) + length(b) + length(c))`),
+   holding a buffer pin ~200 μs per page.
+2. Runs a VACUUM FREEZE loop on the primary (12 iterations, local sync).
 3. Simultaneously probes primary commit latency (45 s).
 
 **Mechanism**: `XLOG_HEAP2_FREEZE_PAGE` replay calls `LockBufferForCleanup()`,
-which waits for all pins on that buffer to drop. With 20 concurrent scans,
-there is sustained pin pressure — each page collision adds a small wait.
-Stalls are many and brief, not one long pause.
+which waits for all pins on that buffer to drop. With 80 concurrent scanners
+cycling through ~1000 pages, collision probability P ≈ 16%. Each of the ~160
+collisions per VACUUM FREEZE pass costs ~200 μs of wait, totalling ~32 ms
+added delay per pass.
 
 **Character**: Unlike S2/S7/S8 (complete stall), this produces many small
 per-page delays that aggregate. Effect shows most clearly as elevated latency
@@ -480,13 +447,9 @@ stddev and p99, not necessarily in the average.
 
 **What to look for**: Slightly uneven progress lines with higher stddev than
 S1. The `replay_lag` bytes will oscillate — rising when pins collide, draining
-between collisions. Not a single clean spike.
+between collisions.
 
-**Typical result**: +3–10 ms average; stronger effect in p99
-
-**Scale**: more pages = more FREEZE_PAGE records = more pin collision
-opportunities per VACUUM FREEZE pass. For the pure WAL-volume aspect of
-anti-wraparound at production scale, see S15.
+**Typical result**: +10–30 ms average; stronger effect in p99
 
 ---
 
@@ -596,54 +559,26 @@ seconds to minutes of stall every time the table is vacuumed.
 
 ---
 
-### S13 — Hash index VACUUM (snapshot + cleanup lock combined)
+### S14 — Replay throughput saturation (5-row × 4 idx, high concurrency)
 
 ```bash
-bash run.sh 13   # ~5 min
+bash run.sh 14   # ~15 min (8 concurrency levels × 2 modes × 20 s each + catchup)
 ```
 
-**Setup**: `hash_test` table (200 K rows) with a hash index and 100 K dead
-tuples. A probe table (`probe_s13`) takes the latency measurement.
+**Setup**: `saturation_test` table (100 K rows, 3 secondary indexes + PK).
+Each transaction updates 5 contiguous rows, modifying both text columns
+and a counter — touching all 4 indexes per row.
 
-**What it does**:
-1. Starts a `REPEATABLE READ` blocker (holds old snapshot) on the standby.
-2. Starts concurrent bucket-page scans on the standby (buffer pin pressure).
-3. Runs `VACUUM hash_test` on the primary to generate `XLOG_HASH_VACUUM_ONE_PAGE` WAL.
-4. Measures primary commit latency during the above.
+**What it does**: Runs pgbench at 1, 2, 4, 8, 16, 32, 64, then 128 clients
+under each sync mode (20 s per level). Prints a concurrency vs latency table
+for both modes side by side.
 
-**Mechanism** (`hash_xlog.c:hash_xlog_vacuum_one_page`): This WAL record type
-is unique in calling **both** conflict mechanisms sequentially:
-1. `ResolveRecoveryConflictWithSnapshot()` — waits for old snapshots to close
-2. `LockBufferForCleanup()` — waits for all bucket-page pins to drop
-
-S2/S7 trigger only step 1; S9 triggers only step 2; S13 requires both.
-
-**What to look for**: A small added latency — the dual mechanism exists in the
-code but the overlap window (snapshot held *and* page pinned simultaneously) is
-narrow in practice.
-
-**Typical result**: +1–5 ms
-
----
-
-### S14 — Replay throughput saturation (high-concurrency ceiling)
-
-```bash
-bash run.sh 14   # ~12 min (6 concurrency levels × 2 modes × 20 s each + catchup)
-```
-
-**Setup**: `saturation_test` table (100 K wide rows — ~500 bytes each). Each
-transaction updates one row, mutating both text columns (~3–5 KB WAL/txn).
-
-**What it does**: Runs pgbench at 1, 2, 4, 8, 16, then 32 clients under each
-sync mode (20 s per level). Prints a concurrency vs latency table for both
-modes side by side.
-
-**Mechanism**: WAL replay is **single-threaded**. As primary concurrency grows,
-WAL generation rate climbs. Under `remote_apply`, each commit must wait for
-its own WAL to be replayed — and the replay thread is shared by all concurrent
-commits. Under `remote_write`, commits only wait for WAL bytes to arrive in
-standby memory, which is independent of replay.
+**Mechanism**: WAL replay is **single-threaded**. Each commit generates
+5 rows × 4 indexes = 20 index modifications of replay work. As primary
+concurrency grows, WAL generation rate exceeds single-threaded replay
+throughput. Under `remote_apply`, each commit must wait in a growing queue.
+Under `remote_write`, commits only wait for WAL bytes to arrive in standby
+memory.
 
 **What to look for**:
 ```
@@ -653,14 +588,12 @@ standby memory, which is independent of replay.
         4         113.2          116.8       +3.6
        16         115.0          128.4      +13.4
        32         118.1          147.3      +29.2
+       64         120.5          183.6      +63.1
+      128         125.2          245.8     +120.6
 ```
 `remote_write` latency stays flat or grows slowly (CPU contention).
 `remote_apply` latency grows faster — the gap (`added_ms`) increasing with
 client count is the signature of replay queuing.
-
-On a small VM, the divergence may be subtle. The number to watch is whether
-`added_ms` **grows monotonically** with client count — that's the signal, even
-if the absolute magnitude is small.
 
 **Typical result**: growing `added_ms` with concurrency; magnitude scales with
 server CPU count and WAL-per-transaction
@@ -728,15 +661,56 @@ recurring, automatic, unavoidable event on long-lived large tables.
 
 ---
 
+## Non-default scenarios
+
+These can be run explicitly but are not included in `bash run.sh`:
+
+### S5 — Bulk INSERT / ETL load
+
+```bash
+bash run.sh 5   # ~4 min
+```
+
+Single large INSERT (500 K rows). Added latency depends on standby I/O
+throughput but is typically < 5 ms on fast storage.
+
+### S6 — FPI storm (frequent checkpoints)
+
+```bash
+bash run.sh 6   # ~4 min
+```
+
+Full Page Image amplification after checkpoints. The effect scales with
+`shared_buffers` size. In a symmetric benchmark config (same `shared_buffers`
+on primary and standby), FPI replay is fast (~300–500 MB/s on NVMe) because
+FPI application is a simple page overwrite — no read-modify-write needed. The
+self-regulating nature of `remote_apply` (TPS drops → less WAL → replay catches
+up) prevents sustained backlog buildup.
+
+This is a real production problem at **scale** (64+ GB `shared_buffers`,
+terabytes of data, bulk jobs touching millions of pages after checkpoint), but
+cannot be reliably demonstrated on a small benchmark.
+
+### S13 — Hash index VACUUM (snapshot + cleanup lock)
+
+```bash
+bash run.sh 13   # ~5 min
+```
+
+Dual conflict mechanism (`ResolveRecoveryConflictWithSnapshot` +
+`LockBufferForCleanup`) exists in code but the overlap window is too narrow
+for reliable demonstration. Typical result: +1–5 ms.
+
+---
+
 ## Effect of `hot_standby_feedback`
 
 | Scenario | Type | `hsf=off` | `hsf=on` |
 |----------|------|-----------|----------|
-| S2 Snapshot conflict | snapshot | stalls | **prevented** |
-| S7 Cross-table blast | snapshot | stalls | **prevented** |
-| S13 Hash VACUUM | snapshot + pin | stalls | mostly prevented |
-| S8 VACUUM FULL | lock conflict | stalls | **no effect** |
-| S9 Buffer pin | buffer pin | minor stall | **no effect** |
+| S2 Snapshot conflict | snapshot | BLOCKED | **prevented** |
+| S7 Cross-table blast | snapshot | BLOCKED | **prevented** |
+| S8 VACUUM FULL | lock conflict | BLOCKED | **no effect** |
+| S9 Buffer pin | buffer pin | +10–30 ms | **no effect** |
 | S12 Logical rewrite fsyncs | I/O overhead | adds ms | **no effect** |
 | S10 Large UPDATE | replay throughput | adds ms | **no effect** |
 | S11 DROP partitions | fs ops on replay | adds ms | **no effect** |
@@ -756,7 +730,7 @@ tradeoff: use `hsf=on` to protect against snapshot-conflict stalls; accept
 bloat risk.
 
 Lock conflicts (S8), buffer-pin conflicts (S9), and all non-conflict replay
-overhead (S10–S13) are unaffected regardless of this setting.
+overhead (S10–S12, S14–S15) are unaffected regardless of this setting.
 
 ---
 
@@ -765,11 +739,18 @@ overhead (S10–S13) are unaffected regardless of this setting.
 ```
   #    Scenario                                rw_ms     ra_ms  added_ms
   ─────────────────────────────────────────────────────────────────────
-     2  Blocked replay (snapshot conflict)      107.6    2141.4   +2033.9
-     7  Reporting query (cross-table blast)     109.7   38233.2  +38123.5
-     8  Table rewrite / lock conflict           144.5   24325.7  +24181.3
+     2  Blocked replay (snapshot conflict)      BLOCKED ← 0 TPS for 65/70s (340x TPS drop)
+     7  Reporting query (cross-table blast)     BLOCKED ← 0 TPS for 80/85s (350x TPS drop)
+     8  Table rewrite / lock conflict           BLOCKED ← 0 TPS for 60/70s (170x TPS drop)
+     1  Index-heavy batch UPDATE (25 rows)      110.2     122.5    +12.3
+     3  GIN + TOAST batch (8 rows)              108.4     119.7    +11.3
+     9  Buffer pin (VACUUM FREEZE)              107.6     128.2    +20.6
 ```
 
+- **BLOCKED**: `remote_apply` commits completely frozen (0 TPS) for the
+  indicated duration. The benchmark reports this instead of misleading average
+  latency (pgbench's average only counts *completed* transactions, hiding the
+  freeze).
 - **`added_ms = ra_ms − rw_ms`** — the pure overhead of waiting for replay
   vs just waiting for WAL to be written to standby memory.
 - A small positive value (< 20 ms) reflects normal inter-server RTT and
